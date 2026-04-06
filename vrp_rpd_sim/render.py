@@ -355,7 +355,8 @@ class SimulationApp:
                     vehicle.position,
                     vehicle.current_node,
                     self.instance.depot_node,
-                    False,
+                    True,
+                    home_slot=vehicle.home_slot,
                 )
                 vehicle.active_path = build_path_state(points)
                 if vehicle.active_path is None:
@@ -470,7 +471,6 @@ class SimulationApp:
 
         vehicle.current_node = target_node
         if vehicle.route_index >= len(vehicle.route):
-            vehicle.position = vehicle.home_slot
             vehicle.completed = True
             vehicle.completion_time = self.sim_time
             vehicle.target_node = None
@@ -516,7 +516,10 @@ class SimulationApp:
         if current_node == self.instance.depot_node and euclidean(current_position, depot_access) > 1e-6:
             points.extend(self._slot_to_depot_access(current_position, depot_access))
 
-        network_points = self.solver.path_coords(current_node, target_node)
+        if returning_home and target_node == self.instance.depot_node:
+            network_points = self._natural_exit_coords(current_node)
+        else:
+            network_points = self.solver.path_coords(current_node, target_node)
         if current_node == self.instance.depot_node:
             network_points = self._trim_depot_boundary_hop(network_points, from_start=True)
         if target_node == self.instance.depot_node:
@@ -547,6 +550,35 @@ class SimulationApp:
             points.append(slot)
         return points
 
+    def _station_for_node(self, node_id: str):
+        for station in self.instance.stations:
+            if station.node_id == node_id:
+                return station
+        return None
+
+    def _exit_waypoint(self, node_id: str) -> str | None:
+        station = self._station_for_node(node_id)
+        if station is None:
+            return None
+        if station.side == "top":
+            for ix, x in enumerate(self.instance.world.road_xs):
+                if math.isclose(station.coord[0], x):
+                    return f"i_{ix}_0"
+        elif station.side == "right":
+            for iy, y in enumerate(self.instance.world.road_ys):
+                if math.isclose(station.coord[1], y):
+                    return f"i_0_{iy}"
+        return None
+
+    def _natural_exit_coords(self, current_node: str) -> List[Coord]:
+        waypoint = self._exit_waypoint(current_node)
+        if waypoint is None:
+            return self.solver.path_coords(current_node, self.instance.depot_node)
+        path1 = self.instance.world.shortest_paths[(current_node, waypoint)]
+        path2 = self.instance.world.shortest_paths[(waypoint, self.instance.depot_node)]
+        combined = list(path1) + list(path2[1:])
+        return self.solver.lane_polyline(combined)
+
     def _trim_depot_boundary_hop(
         self,
         points: List[Coord],
@@ -555,14 +587,12 @@ class SimulationApp:
     ) -> List[Coord]:
         if len(points) < 3:
             return points
-
         boundary_index = 1 if from_start else -2
         depot_index = 0 if from_start else -1
         boundary = points[boundary_index]
         depot_access = points[depot_index]
         if not self._is_boundary_point(boundary) or self._is_boundary_point(depot_access):
             return points
-
         trimmed = list(points)
         trimmed.pop(boundary_index)
         return trimmed

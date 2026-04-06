@@ -1213,6 +1213,10 @@ class VRPRPDSolver:
         node_path = self.instance.world.shortest_paths[(source, target)]
         return self._lane_polyline(node_path)
 
+    def lane_polyline(self, node_path: Sequence[str]) -> List[Tuple[float, float]]:
+        """Public lane-adjusted polyline for an arbitrary node path."""
+        return self._lane_polyline(node_path)
+
     def _lane_polyline(self, node_path: Sequence[str]) -> List[Tuple[float, float]]:
         if not node_path:
             return []
