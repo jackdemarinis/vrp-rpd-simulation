@@ -348,29 +348,37 @@ class SimulationApp:
                 vehicle.current_node != self.instance.depot_node
                 or euclidean(vehicle.position, vehicle.home_slot) > 1e-6
             ):
-                if self._depot_return_in_progress(vehicle.vehicle_id):
-                    continue
                 vehicle.target_node = self.instance.depot_node
-                points = self._travel_points(
-                    vehicle.position,
-                    vehicle.current_node,
-                    self.instance.depot_node,
-                    True,
-                    home_slot=vehicle.home_slot,
-                )
+                if vehicle.current_node != self.instance.depot_node:
+                    points = self._travel_points(
+                        vehicle.position,
+                        vehicle.current_node,
+                        self.instance.depot_node,
+                        True,
+                    )
+                else:
+                    if self._depot_parking_in_progress(vehicle.vehicle_id):
+                        continue
+                    points = self._depot_parking_points(vehicle.position, vehicle.home_slot)
                 vehicle.active_path = build_path_state(points)
                 if vehicle.active_path is None:
-                    vehicle.completed = True
-                    vehicle.completion_time = self.sim_time
+                    if euclidean(vehicle.position, vehicle.home_slot) <= 1e-6:
+                        vehicle.completed = True
+                        vehicle.completion_time = self.sim_time
             else:
                 vehicle.completed = True
                 vehicle.completion_time = self.sim_time
 
-    def _depot_return_in_progress(self, vehicle_id: int) -> bool:
+    def _depot_parking_in_progress(self, vehicle_id: int) -> bool:
         for other in self.vehicles:
             if other.vehicle_id == vehicle_id or other.completed:
                 continue
-            if other.target_node == self.instance.depot_node:
+            if other.active_path is None:
+                continue
+            if (
+                other.current_node == self.instance.depot_node
+                and euclidean(other.position, other.home_slot) > 1e-6
+            ):
                 return True
         return False
 
@@ -378,6 +386,11 @@ class SimulationApp:
         max_distance = config.ALVIK_SPEED_IN_PER_SEC * step
         proposed_positions = {
             vehicle.vehicle_id: vehicle.position
+            for vehicle in self.vehicles
+            if not vehicle.completed
+        }
+        proposed_sweeps = {
+            vehicle.vehicle_id: [vehicle.position] * 7
             for vehicle in self.vehicles
             if not vehicle.completed
         }
@@ -403,18 +416,26 @@ class SimulationApp:
             if travel <= 0:
                 continue
 
-            allowed = self._max_safe_travel(vehicle, travel, proposed_positions)
+            start_distance = path.distance
+            allowed = self._max_safe_travel(vehicle, travel, proposed_positions, proposed_sweeps)
             if allowed <= 1e-5:
+                proposed_sweeps[vehicle.vehicle_id] = self._sample_motion(path, start_distance, start_distance)
                 continue
             path.distance += allowed
             vehicle.position = path.position()
             proposed_positions[vehicle.vehicle_id] = vehicle.position
+            proposed_sweeps[vehicle.vehicle_id] = self._sample_motion(
+                path,
+                start_distance,
+                path.distance,
+            )
 
     def _max_safe_travel(
         self,
         vehicle: VehicleState,
         travel: float,
         proposed_positions: Dict[int, Coord],
+        proposed_sweeps: Dict[int, List[Coord]],
     ) -> float:
         path = vehicle.active_path
         if path is None:
@@ -422,38 +443,90 @@ class SimulationApp:
 
         low = 0.0
         high = travel
-        if self._is_safe_position(
+        if self._is_safe_motion(
             vehicle.vehicle_id,
-            path.position_at(path.distance + high),
+            self._sample_motion(path, path.distance, path.distance + high),
             proposed_positions,
+            proposed_sweeps,
         ):
             return high
 
         for _ in range(14):
             mid = (low + high) / 2.0
-            candidate = path.position_at(path.distance + mid)
-            if self._is_safe_position(vehicle.vehicle_id, candidate, proposed_positions):
+            candidate = self._sample_motion(path, path.distance, path.distance + mid)
+            if self._is_safe_motion(
+                vehicle.vehicle_id,
+                candidate,
+                proposed_positions,
+                proposed_sweeps,
+            ):
                 low = mid
             else:
                 high = mid
         return low
 
-    def _is_safe_position(
+    def _is_safe_motion(
         self,
         vehicle_id: int,
-        candidate: Coord,
+        candidate_sweep: List[Coord],
         proposed_positions: Dict[int, Coord],
+        proposed_sweeps: Dict[int, List[Coord]],
     ) -> bool:
         min_box_spacing = config.ALVIK_SIZE_IN + config.MIN_ALVIK_CLEARANCE_IN
+        candidate_final = candidate_sweep[-1]
         for other_id, other_position in proposed_positions.items():
             if other_id == vehicle_id:
                 continue
-            if (
-                abs(candidate[0] - other_position[0]) < min_box_spacing
-                and abs(candidate[1] - other_position[1]) < min_box_spacing
-            ):
+            if self._positions_conflict(candidate_final, other_position, min_box_spacing):
+                return False
+            other_sweep = proposed_sweeps.get(other_id, [other_position] * len(candidate_sweep))
+            if self._sweeps_conflict(candidate_sweep, other_sweep, min_box_spacing):
                 return False
         return True
+
+    def _sample_motion(
+        self,
+        path: PathState,
+        start_distance: float,
+        end_distance: float,
+        *,
+        sample_count: int = 7,
+    ) -> List[Coord]:
+        if sample_count <= 1:
+            return [path.position_at(end_distance)]
+        if end_distance <= start_distance:
+            position = path.position_at(start_distance)
+            return [position] * sample_count
+        step = (end_distance - start_distance) / (sample_count - 1)
+        return [
+            path.position_at(start_distance + (step * index))
+            for index in range(sample_count)
+        ]
+
+    def _sweeps_conflict(
+        self,
+        first_sweep: List[Coord],
+        second_sweep: List[Coord],
+        min_box_spacing: float,
+    ) -> bool:
+        for index, first in enumerate(first_sweep):
+            start = max(0, index - 1)
+            stop = min(len(second_sweep), index + 2)
+            for other in second_sweep[start:stop]:
+                if self._positions_conflict(first, other, min_box_spacing):
+                    return True
+        return False
+
+    def _positions_conflict(
+        self,
+        first: Coord,
+        second: Coord,
+        min_box_spacing: float,
+    ) -> bool:
+        return (
+            abs(first[0] - second[0]) < min_box_spacing
+            and abs(first[1] - second[1]) < min_box_spacing
+        )
 
     def _resolve_arrivals(self) -> None:
         for vehicle in self.vehicles:
@@ -471,9 +544,10 @@ class SimulationApp:
 
         vehicle.current_node = target_node
         if vehicle.route_index >= len(vehicle.route):
-            vehicle.completed = True
-            vehicle.completion_time = self.sim_time
             vehicle.target_node = None
+            if euclidean(vehicle.position, vehicle.home_slot) <= 1e-6:
+                vehicle.completed = True
+                vehicle.completion_time = self.sim_time
             return
 
         op = vehicle.route[vehicle.route_index]
@@ -528,6 +602,21 @@ class SimulationApp:
 
         if returning_home and home_slot is not None:
             points.extend(self._depot_access_to_slot(depot_access, home_slot))
+        return dedupe_points(points)
+
+    def _depot_parking_points(
+        self,
+        current_position: Coord,
+        home_slot: Coord,
+    ) -> List[Coord]:
+        points = [current_position]
+        if not math.isclose(current_position[0], home_slot[0]):
+            points.append((home_slot[0], current_position[1]))
+        if not (
+            math.isclose(current_position[0], home_slot[0])
+            and math.isclose(current_position[1], home_slot[1])
+        ):
+            points.append(home_slot)
         return dedupe_points(points)
 
     def _slot_to_depot_access(self, slot: Coord, depot_access: Coord) -> List[Coord]:
