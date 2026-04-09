@@ -73,7 +73,8 @@ def main() -> None:
     except ModuleNotFoundError as exc:
         if exc.name == "pygame":
             raise SystemExit(
-                "pygame is not installed. Install the dependency from requirements.txt and rerun."
+                "A compatible pygame package is not installed. Install the dependency from "
+                "requirements.txt and rerun."
             ) from exc
         raise
 
