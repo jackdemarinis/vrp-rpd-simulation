@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import pygame
 
@@ -79,6 +79,7 @@ class VehicleState:
     waiting_customer_id: int | None = None
     completed: bool = False
     completion_time: float | None = None
+    return_slot_index: int | None = None
 
     def load_marker(self) -> int:
         return self.load
@@ -96,6 +97,7 @@ class SimulationApp:
         processing_scale: float | None = None,
         fixed_processing_time: float | None = None,
         fullscreen: bool | None = None,
+        debug_depot: bool = False,
     ) -> None:
         pygame.init()
         pygame.display.set_caption(config.APP_TITLE)
@@ -123,6 +125,18 @@ class SimulationApp:
         self.dragging_speed_slider = False
         self.speed_slider_rect = pygame.Rect(0, 0, 0, 0)
         self.speed_knob_rect = pygame.Rect(0, 0, 0, 0)
+        self.debug_depot = debug_depot
+        self.depot_return_owner_id: int | None = None
+        self._debug_depot_zero_move: Set[int] = set()
+        self._debug_depot_holds: Set[int] = set()
+        self.depot_return_slots = sorted(
+            self.instance.world.depot_slots,
+            key=lambda slot: (round(slot[1], 6), round(slot[0], 6)),
+        )
+        self.depot_return_slot_ranks = {
+            slot: index for index, slot in enumerate(self.depot_return_slots)
+        }
+        self.reserved_return_slots: Set[Coord] = set()
 
         self.screen = self._set_display_mode(self.fullscreen)
         self.clock = pygame.time.Clock()
@@ -219,6 +233,10 @@ class SimulationApp:
     def _reset_simulation(self) -> None:
         self.sim_time = 0.0
         self.paused = False
+        self.depot_return_owner_id = None
+        self._debug_depot_holds.clear()
+        self._debug_depot_zero_move.clear()
+        self.reserved_return_slots.clear()
         self.station_progress = self._build_station_progress()
         self.vehicles = self._build_vehicle_states()
 
@@ -292,18 +310,111 @@ class SimulationApp:
         vehicles = []
         for vehicle_id in range(self.instance.vehicle_count):
             home_slot = slot_by_vehicle[vehicle_id]
+            route = list(self.solution.routes[vehicle_id])
+            return_slot_index = None
+            if not route:
+                return_slot_index = self.depot_return_slot_ranks[home_slot]
+                self.reserved_return_slots.add(home_slot)
             vehicles.append(
                 VehicleState(
                     vehicle_id=vehicle_id,
                     color=PALETTE[vehicle_id % len(PALETTE)],
                     home_slot=home_slot,
-                    route=list(self.solution.routes[vehicle_id]),
+                    route=route,
                     current_node=self.instance.depot_node,
                     position=home_slot,
                     load=self.instance.capacity,
+                    return_slot_index=return_slot_index,
                 )
             )
         return vehicles
+
+    def _debug_depot_message(self, message: str) -> None:
+        if self.debug_depot:
+            print(f"[depot {self.sim_time:6.2f}s] {message}")
+
+    def _is_homebound(self, vehicle: VehicleState) -> bool:
+        return vehicle.route_index >= len(vehicle.route) and not vehicle.completed
+
+    def _assign_return_slot(self, vehicle: VehicleState) -> None:
+        if vehicle.return_slot_index is not None:
+            return
+        for slot in self.depot_return_slots:
+            if slot in self.reserved_return_slots:
+                continue
+            vehicle.home_slot = slot
+            vehicle.return_slot_index = self.depot_return_slot_ranks[slot]
+            self.reserved_return_slots.add(slot)
+            self._debug_depot_message(
+                f"assign V{vehicle.vehicle_id + 1} to slot {vehicle.return_slot_index + 1} "
+                f"at {tuple(round(value, 2) for value in slot)}"
+            )
+            return
+        raise RuntimeError("No available depot return slot.")
+
+    def _distance_to_depot_access(self, position: Coord) -> float:
+        depot_access = self.instance.world.coords[self.instance.depot_node]
+        return euclidean(position, depot_access)
+
+    def _release_depot_return_owner_if_needed(self) -> None:
+        if self.depot_return_owner_id is None:
+            return
+        owner = self.vehicles[self.depot_return_owner_id]
+        if self._is_homebound(owner):
+            return
+        self._debug_depot_message(
+            f"release owner V{owner.vehicle_id + 1} at {tuple(round(value, 2) for value in owner.position)}"
+        )
+        self.depot_return_owner_id = None
+        self._debug_depot_holds.clear()
+        self._debug_depot_zero_move.clear()
+
+    def _sync_depot_return_owner(self, movable: List[VehicleState]) -> None:
+        self._release_depot_return_owner_if_needed()
+        if self.depot_return_owner_id is not None:
+            return
+        candidates = [
+            vehicle
+            for vehicle in movable
+            if self._is_homebound(vehicle)
+            and self._distance_to_depot_access(vehicle.position) <= config.DEPOT_APPROACH_RESERVATION_IN
+        ]
+        if not candidates:
+            return
+        owner = min(
+            candidates,
+            key=lambda vehicle: (self._distance_to_depot_access(vehicle.position), vehicle.vehicle_id),
+        )
+        self.depot_return_owner_id = owner.vehicle_id
+        self._debug_depot_message(
+            "acquire owner "
+            f"V{owner.vehicle_id + 1} at {tuple(round(value, 2) for value in owner.position)} "
+            f"distance={self._distance_to_depot_access(owner.position):.2f}"
+        )
+
+    def _should_hold_for_depot_return(self, vehicle: VehicleState) -> bool:
+        if (
+            self.depot_return_owner_id is None
+            or vehicle.vehicle_id == self.depot_return_owner_id
+            or not self._is_homebound(vehicle)
+        ):
+            self._debug_depot_holds.discard(vehicle.vehicle_id)
+            return False
+
+        if self._distance_to_depot_access(vehicle.position) > config.DEPOT_APPROACH_RESERVATION_IN:
+            self._debug_depot_holds.discard(vehicle.vehicle_id)
+            return False
+
+        if vehicle.vehicle_id not in self._debug_depot_holds:
+            owner_label = self.depot_return_owner_id + 1
+            self._debug_depot_message(
+                "hold "
+                f"V{vehicle.vehicle_id + 1} behind V{owner_label} at "
+                f"{tuple(round(value, 2) for value in vehicle.position)} "
+                f"distance={self._distance_to_depot_access(vehicle.position):.2f}"
+            )
+            self._debug_depot_holds.add(vehicle.vehicle_id)
+        return True
 
     def _step_simulation(self, delta_sim_time: float) -> None:
         remaining = delta_sim_time
@@ -344,6 +455,7 @@ class SimulationApp:
                     self._handle_arrival(vehicle)
                 continue
 
+            self._assign_return_slot(vehicle)
             if (
                 vehicle.current_node != self.instance.depot_node
                 or euclidean(vehicle.position, vehicle.home_slot) > 1e-6
@@ -355,6 +467,7 @@ class SimulationApp:
                         vehicle.current_node,
                         self.instance.depot_node,
                         True,
+                        home_slot=vehicle.home_slot,
                     )
                 else:
                     if self._depot_parking_in_progress(vehicle.vehicle_id):
@@ -399,6 +512,7 @@ class SimulationApp:
             for vehicle in self.vehicles
             if not vehicle.completed and vehicle.waiting_customer_id is None and vehicle.active_path is not None
         ]
+        self._sync_depot_return_owner(movable)
         movable.sort(
             key=lambda vehicle: (
                 vehicle.route_index,
@@ -407,8 +521,15 @@ class SimulationApp:
             ),
             reverse=True,
         )
+        if self.depot_return_owner_id is not None:
+            movable.sort(key=lambda vehicle: vehicle.vehicle_id != self.depot_return_owner_id)
 
         for vehicle in movable:
+            if self._should_hold_for_depot_return(vehicle):
+                proposed_sweeps[vehicle.vehicle_id] = [vehicle.position] * 7
+                self._debug_depot_zero_move.discard(vehicle.vehicle_id)
+                continue
+
             path = vehicle.active_path
             if path is None:
                 continue
@@ -420,7 +541,21 @@ class SimulationApp:
             allowed = self._max_safe_travel(vehicle, travel, proposed_positions, proposed_sweeps)
             if allowed <= 1e-5:
                 proposed_sweeps[vehicle.vehicle_id] = self._sample_motion(path, start_distance, start_distance)
+                if self.debug_depot and self._is_homebound(vehicle):
+                    if vehicle.vehicle_id not in self._debug_depot_zero_move:
+                        owner_label = (
+                            f"V{self.depot_return_owner_id + 1}"
+                            if self.depot_return_owner_id is not None
+                            else "none"
+                        )
+                        self._debug_depot_message(
+                            "blocked "
+                            f"V{vehicle.vehicle_id + 1} at {tuple(round(value, 2) for value in vehicle.position)} "
+                            f"owner={owner_label}"
+                        )
+                        self._debug_depot_zero_move.add(vehicle.vehicle_id)
                 continue
+            self._debug_depot_zero_move.discard(vehicle.vehicle_id)
             path.distance += allowed
             vehicle.position = path.position()
             proposed_positions[vehicle.vehicle_id] = vehicle.position
@@ -510,6 +645,8 @@ class SimulationApp:
         min_box_spacing: float,
     ) -> bool:
         for index, first in enumerate(first_sweep):
+            if index == 0:
+                continue
             start = max(0, index - 1)
             stop = min(len(second_sweep), index + 2)
             for other in second_sweep[start:stop]:
@@ -599,7 +736,6 @@ class SimulationApp:
         if target_node == self.instance.depot_node:
             network_points = self._trim_depot_boundary_hop(network_points, from_start=False)
         points.extend(network_points)
-
         if returning_home and home_slot is not None:
             points.extend(self._depot_access_to_slot(depot_access, home_slot))
         return dedupe_points(points)

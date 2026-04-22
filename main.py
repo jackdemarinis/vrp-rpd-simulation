@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=config.START_FULLSCREEN,
         help="Start the simulation in fullscreen mode.",
     )
+    parser.add_argument(
+        "--debug-depot",
+        action="store_true",
+        help="Print depot return debug logs while the simulation is running.",
+    )
     return parser
 
 
@@ -87,6 +92,7 @@ def main() -> None:
         processing_scale=args.process_scale,
         fixed_processing_time=args.fixed_process_seconds,
         fullscreen=args.fullscreen,
+        debug_depot=args.debug_depot,
     )
     app.run()
 

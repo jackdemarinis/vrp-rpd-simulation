@@ -67,13 +67,14 @@ FPS = 60
 
 # Rendering -----------------------------------------------------------------
 
-WINDOW_WIDTH_PX = 1360
-WINDOW_HEIGHT_PX = 1080
+WINDOW_WIDTH_PX = 1000
+WINDOW_HEIGHT_PX = 800
 WORLD_PADDING_PX = 60
 HUD_WIDTH_PX = 280
 MIN_WINDOW_WIDTH_PX = 980
 MIN_WINDOW_HEIGHT_PX = 760
 START_FULLSCREEN = False
+DEPOT_APPROACH_RESERVATION_IN = ROAD_ENVELOPE_WIDTH_IN + ALVIK_SIZE_IN + MIN_ALVIK_CLEARANCE_IN
 
 # Display lane center on each duct-tape strip rather than the road midpoint.
 LANE_CENTER_OFFSET_IN = (ROAD_MEDIAN_GAP_IN / 2.0) + (ROAD_STRIP_WIDTH_IN / 2.0)
