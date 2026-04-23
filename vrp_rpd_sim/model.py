@@ -39,6 +39,7 @@ class WorldGraph:
     road_ys: List[float]
     depot_anchor: Coord
     depot_slots: List[Coord]
+    depot_entries: Dict[str, List[Coord]]
     road_gap_in: float
     lane_center_offset_in: float
 

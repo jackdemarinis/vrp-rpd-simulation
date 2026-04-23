@@ -82,6 +82,9 @@ DEPOT_APPROACH_RESERVATION_IN = ROAD_ENVELOPE_WIDTH_IN + ALVIK_SIZE_IN + MIN_ALV
 
 # Display lane center on each duct-tape strip rather than the road midpoint.
 LANE_CENTER_OFFSET_IN = (ROAD_MEDIAN_GAP_IN / 2.0) + (ROAD_STRIP_WIDTH_IN / 2.0)
+DEPOT_ENTRY_LANE_OFFSET_IN = LANE_CENTER_OFFSET_IN
+DEPOT_ENTRY_TOP_COUNT = 3
+DEPOT_ENTRY_RIGHT_COUNT = 3
 
 # Solver --------------------------------------------------------------------
 

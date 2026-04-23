@@ -24,39 +24,74 @@ class DepotLayoutTests(unittest.TestCase):
         self.assertEqual(3, len(xs))
         self.assertEqual(3, len(ys))
 
+    def test_depot_entry_points_geometry(self) -> None:
+        world, _ = build_world()
+
+        top_entries = [(round(x, 3), round(y, 3)) for x, y in world.depot_entries["top"]]
+        right_entries = [(round(x, 3), round(y, 3)) for x, y in world.depot_entries["right"]]
+
+        self.assertEqual(
+            [(1.97, 15.0), (6.5, 15.0), (11.03, 15.0)],
+            top_entries,
+        )
+        self.assertEqual(
+            [(15.0, 1.97), (15.0, 6.5), (15.0, 11.03)],
+            right_entries,
+        )
+
     def test_homebound_paths_end_at_assigned_slots(self) -> None:
         instance = build_instance()
         solver = VRPRPDSolver(instance)
         result = solver.solve()
         app = SimulationApp(instance, solver, result)
 
-        depot_access = instance.world.coords[instance.depot_node]
-        for vehicle in app.vehicles:
-            if not vehicle.route:
-                continue
+        active_vehicles = [vehicle for vehicle in app.vehicles if vehicle.route]
+        for vehicle in active_vehicles:
             last_stop = solver.customer_node(vehicle.route[-1].customer_id)
+            vehicle.current_node = last_stop
+            vehicle.position = instance.world.coords[last_stop]
+            vehicle.route_index = len(vehicle.route)
+            vehicle.active_path = None
+
+        app._assign_return_targets()
+
+        for vehicle in active_vehicles[:3]:
             path = app._travel_points(
-                instance.world.coords[last_stop],
-                last_stop,
+                vehicle.position,
+                vehicle.current_node,
                 instance.depot_node,
                 True,
                 home_slot=vehicle.home_slot,
+                depot_entry=vehicle.depot_entry,
+                depot_corridor=vehicle.depot_corridor,
             )
             self.assertEqual(vehicle.home_slot, path[-1])
-            self.assertIn(depot_access, path)
+            self.assertIn(vehicle.depot_entry, path)
 
-    def test_return_slots_fill_from_furthest_corner_first(self) -> None:
+    def test_corridor_stack_invariant_no_crossover(self) -> None:
         instance = build_instance()
         solver = VRPRPDSolver(instance)
         result = solver.solve()
         app = SimulationApp(instance, solver, result)
 
-        active_vehicles = [vehicle for vehicle in app.vehicles if vehicle.route]
-        for vehicle in active_vehicles[:3]:
-            app._assign_return_slot(vehicle)
+        top_corridor_slots = app.depot_corridor_slots["top_1"]
+        self.assertEqual(
+            sorted(top_corridor_slots, key=lambda slot: (round(slot[1], 6), round(slot[0], 6))),
+            top_corridor_slots,
+        )
 
-        assigned_slots = [vehicle.home_slot for vehicle in active_vehicles[:3]]
-        self.assertEqual(app.depot_return_slots[:3], assigned_slots)
+        app.reserved_return_slots = {
+            slot for slot in app.depot_return_slots if slot not in set(top_corridor_slots)
+        }
+        app._refresh_corridor_frontier()
+
+        observed = []
+        for slot in top_corridor_slots:
+            observed.append(app.corridor_next_slot["top_1"])
+            app.reserved_return_slots.add(slot)
+            app._refresh_corridor_frontier()
+
+        self.assertEqual(top_corridor_slots, observed)
 
 
 if __name__ == "__main__":

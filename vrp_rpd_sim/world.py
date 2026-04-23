@@ -130,6 +130,7 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
     )
 
     distances, shortest_paths = _all_pairs_shortest_paths(coords, edges)
+    depot_slots = _build_depot_slots(config.DEPOT_ANCHOR_IN)
     world = WorldGraph(
         coords=coords,
         edges=dict(edges),
@@ -138,7 +139,8 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
         road_xs=road_xs,
         road_ys=road_ys,
         depot_anchor=config.DEPOT_ANCHOR_IN,
-        depot_slots=_build_depot_slots(config.DEPOT_ANCHOR_IN),
+        depot_slots=depot_slots,
+        depot_entries=_depot_entry_points(road_xs, road_ys, depot_slots),
         road_gap_in=road_gap,
         lane_center_offset_in=config.LANE_CENTER_OFFSET_IN,
     )
@@ -284,6 +286,21 @@ def _depot_access_coord(road_xs: List[float], road_ys: List[float]) -> Coord:
         road_xs[0] - config.LANE_CENTER_OFFSET_IN,
         road_ys[0] + config.LANE_CENTER_OFFSET_IN,
     )
+
+
+def _depot_entry_points(
+    road_xs: List[float],
+    road_ys: List[float],
+    depot_slots: List[Coord],
+) -> Dict[str, List[Coord]]:
+    col_xs = sorted({round(x, 6) for x, _ in depot_slots})
+    row_ys = sorted({round(y, 6) for _, y in depot_slots})
+    top_y = road_ys[0] - config.DEPOT_ENTRY_LANE_OFFSET_IN
+    right_x = road_xs[0] - config.DEPOT_ENTRY_LANE_OFFSET_IN
+    return {
+        "top": [(x, top_y) for x in col_xs[: config.DEPOT_ENTRY_TOP_COUNT]],
+        "right": [(right_x, y) for y in row_ys[: config.DEPOT_ENTRY_RIGHT_COUNT]],
+    }
 
 
 def _all_pairs_shortest_paths(
