@@ -12,6 +12,10 @@ HORIZONTAL_ROAD_COUNT = 7
 ROAD_STRIP_WIDTH_IN = 2.0
 ROAD_MEDIAN_GAP_IN = 3.0
 ROAD_ENVELOPE_WIDTH_IN = (2 * ROAD_STRIP_WIDTH_IN) + ROAD_MEDIAN_GAP_IN
+LANE_DIVIDER_COLOR = (230, 190, 60)
+LANE_DIVIDER_WIDTH_IN = 0.25
+LANE_DIVIDER_DASH_IN = 2.0
+LANE_DIVIDER_GAP_IN = 2.0
 
 # Inferred from the user's requested depot footprint plus the required
 # 7x7 Manhattan network. The paper itself uses a distance matrix rather

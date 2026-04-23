@@ -858,37 +858,110 @@ class SimulationApp:
 
     def _draw_vertical_road(self, x_in: float) -> None:
         center_x, _ = self._to_screen((x_in, 0.0))
-        strip_w = config.ROAD_STRIP_WIDTH_IN * self.world_scale
-        gap_w = config.ROAD_MEDIAN_GAP_IN * self.world_scale
         total_w = config.ROAD_ENVELOPE_WIDTH_IN * self.world_scale
         road_y = self.world_top_px
         road_h = self.world_height_px
         left_x = center_x - (total_w / 2.0)
 
-        pygame.draw.rect(self.screen, ROAD_STRIP, (left_x, road_y, strip_w, road_h), border_radius=4)
-        pygame.draw.rect(
-            self.screen,
-            ROAD_STRIP,
-            (left_x + strip_w + gap_w, road_y, strip_w, road_h),
-            border_radius=4,
-        )
+        pygame.draw.rect(self.screen, ROAD_STRIP, (left_x, road_y, total_w, road_h), border_radius=4)
+
+        divider_spans = [(0.0, config.WORLD_SIZE_IN)]
+        half_envelope = config.ROAD_ENVELOPE_WIDTH_IN / 2.0
+        for y_in in self.instance.world.road_ys:
+            divider_spans = subtract_span_list(
+                divider_spans,
+                max(0.0, y_in - half_envelope),
+                min(config.WORLD_SIZE_IN, y_in + half_envelope),
+            )
+
+        dash_len_px = config.LANE_DIVIDER_DASH_IN * self.world_scale
+        gap_len_px = config.LANE_DIVIDER_GAP_IN * self.world_scale
+        divider_width_px = max(1, int(round(config.LANE_DIVIDER_WIDTH_IN * self.world_scale)))
+        for start_y, end_y in divider_spans:
+            start_px = self._to_screen((x_in, start_y))
+            end_px = self._to_screen((x_in, end_y))
+            self._draw_dashed_line(
+                start_px,
+                end_px,
+                config.LANE_DIVIDER_COLOR,
+                dash_len_px,
+                gap_len_px,
+                divider_width_px,
+            )
 
     def _draw_horizontal_road(self, y_in: float) -> None:
         _, center_y = self._to_screen((0.0, y_in))
-        strip_w = config.ROAD_STRIP_WIDTH_IN * self.world_scale
-        gap_w = config.ROAD_MEDIAN_GAP_IN * self.world_scale
         total_w = config.ROAD_ENVELOPE_WIDTH_IN * self.world_scale
         road_x = self.world_left_px
         road_w = self.world_width_px
         top_y = center_y - (total_w / 2.0)
 
-        pygame.draw.rect(self.screen, ROAD_STRIP, (road_x, top_y, road_w, strip_w), border_radius=4)
-        pygame.draw.rect(
-            self.screen,
-            ROAD_STRIP,
-            (road_x, top_y + strip_w + gap_w, road_w, strip_w),
-            border_radius=4,
-        )
+        pygame.draw.rect(self.screen, ROAD_STRIP, (road_x, top_y, road_w, total_w), border_radius=4)
+
+        divider_spans = [(0.0, config.WORLD_SIZE_IN)]
+        half_envelope = config.ROAD_ENVELOPE_WIDTH_IN / 2.0
+        for x_in in self.instance.world.road_xs:
+            divider_spans = subtract_span_list(
+                divider_spans,
+                max(0.0, x_in - half_envelope),
+                min(config.WORLD_SIZE_IN, x_in + half_envelope),
+            )
+
+        dash_len_px = config.LANE_DIVIDER_DASH_IN * self.world_scale
+        gap_len_px = config.LANE_DIVIDER_GAP_IN * self.world_scale
+        divider_width_px = max(1, int(round(config.LANE_DIVIDER_WIDTH_IN * self.world_scale)))
+        for start_x, end_x in divider_spans:
+            start_px = self._to_screen((start_x, y_in))
+            end_px = self._to_screen((end_x, y_in))
+            self._draw_dashed_line(
+                start_px,
+                end_px,
+                config.LANE_DIVIDER_COLOR,
+                dash_len_px,
+                gap_len_px,
+                divider_width_px,
+            )
+
+    def _draw_dashed_line(
+        self,
+        start_px: Coord,
+        end_px: Coord,
+        color: Tuple[int, int, int],
+        dash_len: float,
+        gap_len: float,
+        width: int,
+    ) -> None:
+        if dash_len <= 0 or width <= 0:
+            return
+
+        dx = end_px[0] - start_px[0]
+        dy = end_px[1] - start_px[1]
+        length = math.hypot(dx, dy)
+        if length <= 1e-6:
+            return
+
+        progress = 0.0
+        cycle_len = dash_len + max(0.0, gap_len)
+        while progress < length:
+            segment_end = min(progress + dash_len, length)
+            start_ratio = progress / length
+            end_ratio = segment_end / length
+            dash_start = (
+                start_px[0] + (dx * start_ratio),
+                start_px[1] + (dy * start_ratio),
+            )
+            dash_end = (
+                start_px[0] + (dx * end_ratio),
+                start_px[1] + (dy * end_ratio),
+            )
+            pygame.draw.line(
+                self.screen,
+                color,
+                (round(dash_start[0]), round(dash_start[1])),
+                (round(dash_end[0]), round(dash_end[1])),
+                width=width,
+            )
+            progress += cycle_len
 
     def _draw_depot(self) -> None:
         slots = self.instance.world.depot_slots
