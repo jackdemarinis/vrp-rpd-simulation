@@ -82,6 +82,7 @@ class VehicleState:
     return_slot_index: int | None = None
     depot_entry: Coord | None = None
     depot_corridor: str | None = None
+    launch_time: float = 0.0
 
     def load_marker(self) -> int:
         return self.load
@@ -311,6 +312,9 @@ class SimulationApp:
         }
 
         vehicles = []
+        launch_order = {
+            vehicle_id: index for index, vehicle_id in enumerate(active_vehicle_ids)
+        }
         for vehicle_id in range(self.instance.vehicle_count):
             home_slot = slot_by_vehicle[vehicle_id]
             route = list(self.solution.routes[vehicle_id])
@@ -328,6 +332,7 @@ class SimulationApp:
                     position=home_slot,
                     load=self.instance.capacity,
                     return_slot_index=return_slot_index,
+                    launch_time=launch_order.get(vehicle_id, 0) * 8.0,
                 )
             )
         return vehicles
@@ -566,6 +571,12 @@ class SimulationApp:
                 continue
 
             if vehicle.route_index < len(vehicle.route):
+                if (
+                    vehicle.route_index == 0
+                    and vehicle.current_node == self.instance.depot_node
+                    and self.sim_time < vehicle.launch_time
+                ):
+                    continue
                 op = vehicle.route[vehicle.route_index]
                 target_node = self.solver.customer_node(op.customer_id)
                 vehicle.target_node = target_node
@@ -624,8 +635,9 @@ class SimulationApp:
         ]
         movable.sort(
             key=lambda vehicle: (
-                vehicle.route_index,
                 0.0 if vehicle.active_path is None else vehicle.active_path.distance,
+                1 if self._is_homebound(vehicle) else 0,
+                vehicle.route_index,
                 -vehicle.vehicle_id,
             ),
             reverse=True,
@@ -748,10 +760,11 @@ class SimulationApp:
         second: Coord,
         min_box_spacing: float,
     ) -> bool:
-        return (
-            abs(first[0] - second[0]) < min_box_spacing
-            and abs(first[1] - second[1]) < min_box_spacing
+        min_center_distance = (
+            (config.ALVIK_SIZE_IN / 2.0)
+            + (config.MIN_ALVIK_CLEARANCE_IN / 2.0)
         )
+        return euclidean(first, second) < min(min_box_spacing, min_center_distance)
 
     def _resolve_arrivals(self) -> None:
         for vehicle in self.vehicles:
@@ -999,7 +1012,6 @@ class SimulationApp:
         for y in self.instance.world.road_ys:
             self._draw_horizontal_road(y)
 
-        self._draw_depot()
         self._draw_stations()
         self._draw_vehicles()
 
@@ -1110,22 +1122,9 @@ class SimulationApp:
             )
             progress += cycle_len
 
-    def _draw_depot(self) -> None:
-        slots = self.instance.world.depot_slots
-        xs = [coord[0] for coord in slots]
-        ys = [coord[1] for coord in slots]
-        margin = 0.9
-        left, top = self._to_screen((min(xs) - margin, max(ys) + margin))
-        right, bottom = self._to_screen((max(xs) + margin, min(ys) - margin))
-        rect = pygame.Rect(left, top, right - left, bottom - top)
-        pygame.draw.rect(self.screen, DEPOT_BG, rect, border_radius=12)
-        pygame.draw.rect(self.screen, DEPOT_EDGE, rect, width=2, border_radius=12)
-        label = self.font.render("Depot", True, DEPOT_EDGE)
-        self.screen.blit(label, (rect.x + 10, rect.y + 8))
-
     def _draw_stations(self) -> None:
-        station_w = max(54, int(config.ALVIK_SIZE_IN * self.world_scale * 1.35))
-        station_h = max(34, int(config.ALVIK_SIZE_IN * self.world_scale * 0.85))
+        gap_px = self.instance.world.road_gap_in * self.world_scale
+        station_size = max(12, int(round(gap_px)) - 1)
         active_ids = set(self.instance.active_job_ids)
 
         for station in self.instance.stations:
@@ -1135,22 +1134,19 @@ class SimulationApp:
                 color = STATION_INACTIVE
 
             x_px, y_px = self._to_screen(station.coord)
-            rect = pygame.Rect(0, 0, station_w, station_h)
+            rect = pygame.Rect(0, 0, station_size, station_size)
             rect.center = (x_px, y_px)
-            pygame.draw.rect(self.screen, color, rect, border_radius=8)
-            pygame.draw.rect(self.screen, ROAD_EDGE, rect, width=2, border_radius=8)
+            pygame.draw.rect(self.screen, color, rect, border_radius=4)
+            pygame.draw.rect(self.screen, ROAD_EDGE, rect, width=1, border_radius=4)
 
-            label_font = self._fit_font(station.name, station_w - 8, max(8, (station_h // 2) - 6))
-            status_font = self._fit_font(state, station_w - 8, max(8, (station_h // 2) - 6))
+            label_font = self._fit_font(station.name, station_size - 4, station_size - 4)
             label = label_font.render(station.name, True, TEXT_DARK)
-            status = status_font.render(state, True, TEXT_DARK)
             self.screen.blit(
                 label,
-                (rect.centerx - (label.get_width() / 2), rect.y + 4),
-            )
-            self.screen.blit(
-                status,
-                (rect.centerx - (status.get_width() / 2), rect.bottom - status.get_height() - 4),
+                (
+                    rect.centerx - (label.get_width() / 2),
+                    rect.centery - (label.get_height() / 2),
+                ),
             )
 
     def _draw_vehicles(self) -> None:

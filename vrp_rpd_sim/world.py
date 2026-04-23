@@ -85,33 +85,7 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
         row_nodes.append(right_nodes[iy])
         _connect_consecutive(coords, edges, row_nodes, axis="x")
 
-    stations: List[Station] = []
-    station_counter = 1
-    for side in ("bottom", "right", "top", "left"):
-        for road_index in config.STATION_ROAD_INDEX_LAYOUT[side]:
-            station_id = station_counter
-            station_name = f"S{station_id:02d}"
-            node_id = f"station_{station_id:02d}"
-            if side == "bottom":
-                anchor = bottom_nodes[road_index]
-            elif side == "top":
-                anchor = top_nodes[road_index]
-            elif side == "left":
-                anchor = left_nodes[road_index]
-            else:
-                anchor = right_nodes[road_index]
-            coords[node_id] = coords[anchor]
-            _add_edge(edges, node_id, anchor, 0.0)
-            stations.append(
-                Station(
-                    station_id=station_id,
-                    name=station_name,
-                    side=side,
-                    node_id=node_id,
-                    coord=coords[node_id],
-                )
-            )
-            station_counter += 1
+    stations = _build_interior_stations(coords, edges, road_xs, road_ys)
 
     depot_node = "depot"
     depot_access = _depot_access_coord(road_xs, road_ys)
@@ -207,19 +181,23 @@ def select_active_job_ids(stations: Iterable[Station], count: int) -> List[int]:
     if count < 1:
         raise ValueError("ACTIVE_JOB_COUNT must be at least 1.")
     if count > len(station_list):
-        raise ValueError("ACTIVE_JOB_COUNT cannot exceed the number of perimeter stations.")
+        raise ValueError("ACTIVE_JOB_COUNT cannot exceed the number of stations.")
 
-    side_queues = {
-        side: [station.station_id for station in station_list if station.side == side]
-        for side in ("bottom", "right", "top", "left")
-    }
+    ordered_ids = [station.station_id for station in station_list]
+    if count == len(ordered_ids):
+        return ordered_ids
+
     selected: List[int] = []
-    while len(selected) < count:
-        for side in ("bottom", "right", "top", "left"):
-            if len(selected) >= count:
-                break
-            if side_queues[side]:
-                selected.append(side_queues[side].pop(0))
+    used_indexes = set()
+    total = len(ordered_ids)
+    for pick in range(count):
+        index = min(total - 1, math.floor(((pick + 0.5) * total) / count))
+        while index in used_indexes and index + 1 < total:
+            index += 1
+        while index in used_indexes and index > 0:
+            index -= 1
+        used_indexes.add(index)
+        selected.append(ordered_ids[index])
     return selected
 
 
@@ -303,6 +281,54 @@ def _depot_entry_points(
     }
 
 
+def _interior_block_centers(
+    road_xs: List[float],
+    road_ys: List[float],
+) -> List[Tuple[int, int, Coord]]:
+    """Return row-major road-enclosed block centers from bottom-left upward."""
+    blocks: List[Tuple[int, int, Coord]] = []
+    for iy in range(len(road_ys) - 1):
+        cy = (road_ys[iy] + road_ys[iy + 1]) / 2.0
+        for ix in range(len(road_xs) - 1):
+            cx = (road_xs[ix] + road_xs[ix + 1]) / 2.0
+            blocks.append((ix, iy, (cx, cy)))
+    return blocks
+
+
+def _build_interior_stations(
+    coords: Dict[str, Coord],
+    edges: Dict[str, List[Tuple[str, float]]],
+    road_xs: List[float],
+    road_ys: List[float],
+) -> List[Station]:
+    stations: List[Station] = []
+    for station_id, (ix, iy, coord) in enumerate(_interior_block_centers(road_xs, road_ys), start=1):
+        node_id = f"station_{station_id:02d}"
+        access_node_id = f"station_access_{station_id:02d}"
+        access_coord = (coord[0], road_ys[iy + 1])
+        coords[node_id] = coord
+        coords[access_node_id] = access_coord
+
+        _add_edge(edges, node_id, access_node_id, abs(access_coord[1] - coord[1]))
+        if ix < ((len(road_xs) - 1) // 2):
+            anchor_node = f"i_{ix + 1}_{iy + 1}"
+            anchor_distance = abs(road_xs[ix + 1] - access_coord[0])
+        else:
+            anchor_node = f"i_{ix}_{iy + 1}"
+            anchor_distance = abs(access_coord[0] - road_xs[ix])
+        _add_edge(edges, access_node_id, anchor_node, anchor_distance)
+        stations.append(
+            Station(
+                station_id=station_id,
+                name=str(station_id),
+                side="interior",
+                node_id=node_id,
+                coord=coord,
+            )
+        )
+    return stations
+
+
 def _all_pairs_shortest_paths(
     coords: Dict[str, Coord],
     edges: Dict[str, List[Tuple[str, float]]],
@@ -354,3 +380,7 @@ def _reconstruct_path(
         node = parent
     path.reverse()
     return path
+
+
+def euclidean(a: Coord, b: Coord) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])

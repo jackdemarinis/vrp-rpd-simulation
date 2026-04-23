@@ -22,13 +22,6 @@ LANE_DIVIDER_GAP_IN = 2.0
 # than physical geometry, so this spacing is intentionally editable.
 ROAD_EDGE_MARGIN_IN = 14.0
 
-STATION_ROAD_INDEX_LAYOUT = {
-    "bottom": [1, 2, 4, 5],
-    "right": [1, 2, 4, 5],
-    "top": [1, 2, 4, 5],
-    "left": [1, 2, 4, 5],
-}
-
 # Alvik and depot ------------------------------------------------------------
 
 ALVIK_SIZE_CM = 9.6
@@ -38,10 +31,8 @@ MIN_ALVIK_CLEARANCE_IN = 0.5
 ALVIK_COUNT = 9
 
 # The paper separates transport vehicles from identical resources. This demo
-# uses the 9 visible Alviks as the transport agents and assigns each one
-# capacity 1 so the total number of in-system resources equals the number of
-# Alviks. Keep editable.
-VEHICLE_CAPACITY = 1
+# uses the 9 visible Alviks as the transport agents and keeps capacity editable.
+VEHICLE_CAPACITY = 4
 
 DEPOT_STACK_COLUMNS = 3
 DEPOT_STACK_ROWS = 3
@@ -53,7 +44,7 @@ DEPOT_ANCHOR_IN = (6.5, 6.5)
 
 # Stations and processing ----------------------------------------------------
 
-ACTIVE_JOB_COUNT = 16
+ACTIVE_JOB_COUNT = 36
 PROCESSING_TIME_VARIANT = "base"  # "base", "2x", "5x", "1R10", "1R20"
 PROCESSING_TIME_SEED = 7
 PROCESSING_TIME_SCALE = 1.0

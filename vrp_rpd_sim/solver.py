@@ -25,8 +25,15 @@ class SolverRunResult:
     initial: EvaluatedSolution
     alns: EvaluatedSolution
     brkga: EvaluatedSolution
+    selected_label: str
     best_label: str
     best: EvaluatedSolution
+
+
+@dataclass(frozen=True)
+class QuickEvaluation:
+    feasible: bool
+    makespan: float
 
 
 class VRPRPDSolver:
@@ -37,6 +44,9 @@ class VRPRPDSolver:
         self.rng = random.Random(config.SOLVER_RANDOM_SEED)
         self.customers = list(self.instance.active_job_ids)
         self.customer_set = set(self.customers)
+        self.customer_index = {
+            customer_id: index for index, customer_id in enumerate(self.customers)
+        }
         self.operation_gene_order = []
         self.gene_index: Dict[Tuple[int, str], int] = {}
         for customer_id in self.customers:
@@ -44,6 +54,32 @@ class VRPRPDSolver:
                 op = Operation(customer_id, kind)
                 self.gene_index[(customer_id, kind)] = len(self.operation_gene_order)
                 self.operation_gene_order.append(op)
+
+        self.node_index = {
+            node_id: index
+            for index, node_id in enumerate(self.instance.world.coords)
+        }
+        self.depot_node_index = self.node_index[self.instance.depot_node]
+        self.customer_node_indices = [
+            self.node_index[self.customer_node(customer_id)]
+            for customer_id in self.customers
+        ]
+        self.processing_time_array = [
+            self.instance.processing_times[customer_id]
+            for customer_id in self.customers
+        ]
+        node_count = len(self.node_index)
+        self.travel_times_dense = [
+            [0.0 for _ in range(node_count)]
+            for _ in range(node_count)
+        ]
+        for source, targets in self.instance.world.distances.items():
+            source_index = self.node_index[source]
+            for target, distance in targets.items():
+                target_index = self.node_index[target]
+                self.travel_times_dense[source_index][target_index] = (
+                    distance / config.ALVIK_SPEED_IN_PER_SEC
+                )
 
         self.destroy_names = [
             "random",
@@ -59,6 +95,118 @@ class VRPRPDSolver:
             "regret3",
             "regretm",
         ]
+
+    def _quick_infeasible(self) -> QuickEvaluation:
+        return QuickEvaluation(feasible=False, makespan=float("inf"))
+
+    def _evaluate_cost(self, routes: Routes, require_complete: bool = True) -> QuickEvaluation:
+        customer_count = len(self.customers)
+        total_ops = sum(len(route) for route in routes)
+
+        if total_ops == 0:
+            if require_complete and customer_count:
+                return self._quick_infeasible()
+            return QuickEvaluation(feasible=True, makespan=0.0)
+
+        drop_counts = [0] * customer_count
+        pickup_counts = [0] * customer_count
+        drop_indices = [-1] * customer_count
+        pickup_indices = [-1] * customer_count
+        adjacency: List[List[Tuple[int, float]]] = [[] for _ in range(total_ops)]
+        indegree = [0] * total_ops
+        completion = [float("-inf")] * total_ops
+        source_edges: List[Tuple[int, float]] = []
+        last_op = [-1] * self.instance.vehicle_count
+        last_station = [self.depot_node_index] * self.instance.vehicle_count
+
+        customer_index = self.customer_index
+        customer_node_indices = self.customer_node_indices
+        travel_times = self.travel_times_dense
+        capacity = self.instance.capacity
+
+        global_op_index = 0
+        for vehicle_id, route in enumerate(routes):
+            load = capacity
+            prev_op = -1
+            prev_station = self.depot_node_index
+            for operation in route:
+                if operation.kind not in {"D", "P"}:
+                    return self._quick_infeasible()
+                customer_idx = customer_index[operation.customer_id]
+                station_idx = customer_node_indices[customer_idx]
+                is_pickup = operation.kind == "P"
+                if is_pickup:
+                    pickup_counts[customer_idx] += 1
+                    pickup_indices[customer_idx] = global_op_index
+                    load += 1
+                else:
+                    drop_counts[customer_idx] += 1
+                    drop_indices[customer_idx] = global_op_index
+                    load -= 1
+                if load < 0 or load > capacity:
+                    return self._quick_infeasible()
+
+                travel = travel_times[prev_station][station_idx]
+                if prev_op == -1:
+                    source_edges.append((global_op_index, travel))
+                else:
+                    adjacency[prev_op].append((global_op_index, travel))
+                    indegree[global_op_index] += 1
+                prev_op = global_op_index
+                prev_station = station_idx
+                global_op_index += 1
+
+            if prev_op != -1:
+                last_op[vehicle_id] = prev_op
+                last_station[vehicle_id] = prev_station
+
+        for customer_idx in range(customer_count):
+            drops = drop_counts[customer_idx]
+            pickups = pickup_counts[customer_idx]
+            if drops == pickups == 0:
+                if require_complete:
+                    return self._quick_infeasible()
+                continue
+            if drops != 1 or pickups != 1:
+                return self._quick_infeasible()
+            drop_op = drop_indices[customer_idx]
+            pickup_op = pickup_indices[customer_idx]
+            adjacency[drop_op].append((pickup_op, self.processing_time_array[customer_idx]))
+            indegree[pickup_op] += 1
+
+        for op_index, travel in source_edges:
+            completion[op_index] = max(completion[op_index], travel)
+
+        queue = deque(
+            op_index
+            for op_index in range(total_ops)
+            if indegree[op_index] == 0
+        )
+        processed = 0
+        while queue:
+            node = queue.popleft()
+            processed += 1
+            node_time = completion[node]
+            for neighbor, weight in adjacency[node]:
+                candidate = node_time + weight
+                if candidate > completion[neighbor]:
+                    completion[neighbor] = candidate
+                indegree[neighbor] -= 1
+                if indegree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if processed != total_ops:
+            return self._quick_infeasible()
+
+        makespan = 0.0
+        for vehicle_id, op_index in enumerate(last_op):
+            if op_index < 0:
+                continue
+            return_time = completion[op_index] + travel_times[last_station[vehicle_id]][self.depot_node_index]
+            if return_time > makespan:
+                makespan = return_time
+
+        return QuickEvaluation(feasible=True, makespan=makespan)
 
     def solve(self) -> SolverRunResult:
         initial_routes = self.construct_initial_solution()
@@ -77,6 +225,7 @@ class VRPRPDSolver:
             initial=initial_eval,
             alns=alns_eval,
             brkga=brkga_eval,
+            selected_label="paper",
             best_label=best_label,
             best=labeled[best_label],
         )
@@ -414,19 +563,25 @@ class VRPRPDSolver:
             q = self._sample_removal_size()
             partial_routes, removed_customers = self._destroy(current_routes, current_eval, destroy_name, q)
             candidate_routes = self._repair(partial_routes, removed_customers, repair_name)
-            candidate_eval = self.evaluate(candidate_routes, require_complete=True)
-            if not candidate_eval.feasible:
+            quick_candidate = self._evaluate_cost(candidate_routes, require_complete=True)
+            if not quick_candidate.feasible:
                 candidate_eval = self._fallback_repair(partial_routes, removed_customers)
                 candidate_routes = candidate_eval.routes
+                candidate_makespan = candidate_eval.makespan
+            else:
+                candidate_eval = None
+                candidate_makespan = quick_candidate.makespan
 
             accepted = False
-            if candidate_eval.makespan < current_eval.makespan:
+            if candidate_makespan < current_eval.makespan:
+                if candidate_eval is None:
+                    candidate_eval = self.evaluate(candidate_routes, require_complete=True)
                 current_routes = candidate_routes
                 current_eval = candidate_eval
                 destroy_scores[destroy_name] += config.ALNS_SCORE_SIGMA_2
                 repair_scores[repair_name] += config.ALNS_SCORE_SIGMA_2
                 accepted = True
-                if candidate_eval.makespan < best_eval.makespan:
+                if candidate_makespan < best_eval.makespan:
                     best_routes = clone_routes(candidate_routes)
                     best_eval = candidate_eval
                     destroy_scores[destroy_name] += (
@@ -437,8 +592,10 @@ class VRPRPDSolver:
                     )
                     stagnation = 0
             else:
-                delta = candidate_eval.makespan - current_eval.makespan
+                delta = candidate_makespan - current_eval.makespan
                 if temperature > 0 and self.rng.random() < math.exp(-(delta / temperature)):
+                    if candidate_eval is None:
+                        candidate_eval = self.evaluate(candidate_routes, require_complete=True)
                     current_routes = candidate_routes
                     current_eval = candidate_eval
                     destroy_scores[destroy_name] += config.ALNS_SCORE_SIGMA_3
@@ -544,7 +701,7 @@ class VRPRPDSolver:
         gains = []
         for customer_id in self.customers:
             candidate = remove_customer(routes, customer_id)
-            candidate_eval = self.evaluate(candidate, require_complete=False)
+            candidate_eval = self._evaluate_cost(candidate, require_complete=False)
             gain = evaluation.makespan - candidate_eval.makespan
             gains.append((customer_id, gain))
         gains.sort(key=lambda item: item[1], reverse=True)
@@ -629,7 +786,7 @@ class VRPRPDSolver:
         gains = []
         for customer_id in candidates:
             candidate = remove_customer(routes, customer_id)
-            candidate_eval = self.evaluate(candidate, require_complete=False)
+            candidate_eval = self._evaluate_cost(candidate, require_complete=False)
             gains.append((customer_id, evaluation.makespan - candidate_eval.makespan))
         gains.sort(key=lambda item: item[1], reverse=True)
         removed = [customer_id for customer_id, _ in gains[:q]]
@@ -690,9 +847,9 @@ class VRPRPDSolver:
                 candidates = self._enumerate_customer_insertions(current, customer_id, top_k=1)
                 if not candidates:
                     continue
-                _, candidate_eval, candidate_routes = candidates[0]
-                if candidate_eval.makespan < best_cost:
-                    best_cost = candidate_eval.makespan
+                candidate_cost, candidate_routes = candidates[0]
+                if candidate_cost < best_cost:
+                    best_cost = candidate_cost
                     best_customer = customer_id
                     best_routes = candidate_routes
             if best_customer is None or best_routes is None:
@@ -718,8 +875,8 @@ class VRPRPDSolver:
                 candidates = self._enumerate_customer_insertions(current, customer_id, top_k=top_k)
                 if not candidates:
                     continue
-                best_cost, best_eval, best_routes = candidates[0]
-                reference_costs = [cost for cost, _, _ in candidates[:top_k]]
+                best_cost, best_routes = candidates[0]
+                reference_costs = [cost for cost, _ in candidates[:top_k]]
                 while len(reference_costs) < top_k:
                     reference_costs.append(reference_costs[-1])
                 regret = sum(cost - reference_costs[0] for cost in reference_costs[1:])
@@ -743,7 +900,7 @@ class VRPRPDSolver:
             candidates = self._enumerate_customer_insertions(repaired, customer_id, top_k=1)
             if not candidates:
                 continue
-            _, _, repaired = candidates[0]
+            _, repaired = candidates[0]
         return self.evaluate(repaired, require_complete=True)
 
     def _enumerate_customer_insertions(
@@ -751,8 +908,8 @@ class VRPRPDSolver:
         routes: Routes,
         customer_id: int,
         top_k: int,
-    ) -> List[Tuple[float, EvaluatedSolution, Routes]]:
-        options: List[Tuple[float, EvaluatedSolution, Routes]] = []
+    ) -> List[Tuple[float, Routes]]:
+        options: List[Tuple[float, Routes]] = []
         base = remove_customer(routes, customer_id)
         for drop_vehicle in range(self.instance.vehicle_count):
             for drop_pos in range(len(base[drop_vehicle]) + 1):
@@ -765,9 +922,9 @@ class VRPRPDSolver:
                     for pickup_pos in range(pickup_start, len(with_drop[pickup_vehicle]) + 1):
                         candidate = clone_routes(with_drop)
                         candidate[pickup_vehicle].insert(pickup_pos, Operation(customer_id, "P"))
-                        candidate_eval = self.evaluate(candidate, require_complete=False)
+                        candidate_eval = self._evaluate_cost(candidate, require_complete=False)
                         if candidate_eval.feasible:
-                            options.append((candidate_eval.makespan, candidate_eval, candidate))
+                            options.append((candidate_eval.makespan, candidate))
         options.sort(key=lambda item: item[0])
         return options[:top_k]
 
@@ -775,16 +932,16 @@ class VRPRPDSolver:
         self,
         routes: Routes,
         customer_id: int,
-    ) -> List[Tuple[float, EvaluatedSolution, Routes]]:
-        options: List[Tuple[float, EvaluatedSolution, Routes]] = []
+    ) -> List[Tuple[float, Routes]]:
+        options: List[Tuple[float, Routes]] = []
         base = remove_pickup(routes, customer_id)
         for pickup_vehicle in range(self.instance.vehicle_count):
             for pickup_pos in range(len(base[pickup_vehicle]) + 1):
                 candidate = clone_routes(base)
                 candidate[pickup_vehicle].insert(pickup_pos, Operation(customer_id, "P"))
-                candidate_eval = self.evaluate(candidate, require_complete=True)
+                candidate_eval = self._evaluate_cost(candidate, require_complete=True)
                 if candidate_eval.feasible:
-                    options.append((candidate_eval.makespan, candidate_eval, candidate))
+                    options.append((candidate_eval.makespan, candidate))
         options.sort(key=lambda item: item[0])
         return options
 
@@ -813,13 +970,13 @@ class VRPRPDSolver:
                 options = self._enumerate_pickup_insertions(current, customer_id)
                 if not options:
                     continue
-                best_cost, candidate_eval, candidate_routes = options[0]
+                best_cost, candidate_routes = options[0]
                 if best_cost < current_eval.makespan:
                     if best_option is None or best_cost < best_option[0]:
-                        best_option = (best_cost, candidate_eval, candidate_routes)
+                        best_option = (best_cost, candidate_routes)
             if best_option is None:
                 break
-            _, _, current = best_option
+            _, current = best_option
             changed = True
         return current, changed
 
@@ -833,13 +990,13 @@ class VRPRPDSolver:
                 options = self._enumerate_customer_insertions(current, customer_id, top_k=1)
                 if not options:
                     continue
-                best_cost, candidate_eval, candidate_routes = options[0]
+                best_cost, candidate_routes = options[0]
                 if best_cost < current_eval.makespan:
                     if best_option is None or best_cost < best_option[0]:
-                        best_option = (best_cost, candidate_eval, candidate_routes)
+                        best_option = (best_cost, candidate_routes)
             if best_option is None:
                 break
-            _, _, current = best_option
+            _, current = best_option
             changed = True
         return current, changed
 
@@ -874,19 +1031,15 @@ class VRPRPDSolver:
                                 candidate[pickup_vehicle].insert(
                                     pickup_pos, Operation(customer_id, "P")
                                 )
-                                candidate_eval = self.evaluate(candidate, require_complete=True)
+                                candidate_eval = self._evaluate_cost(candidate, require_complete=True)
                                 if not candidate_eval.feasible:
                                     continue
                                 if candidate_eval.makespan < current_eval.makespan:
                                     if best_option is None or candidate_eval.makespan < best_option[0]:
-                                        best_option = (
-                                            candidate_eval.makespan,
-                                            candidate_eval,
-                                            candidate,
-                                        )
+                                        best_option = (candidate_eval.makespan, candidate)
             if best_option is None:
                 break
-            _, _, current = best_option
+            _, current = best_option
             changed = True
         return current, changed
 
@@ -1080,7 +1233,7 @@ class VRPRPDSolver:
         if unscheduled:
             return base_fitness + (config.BRKGA_INFEASIBILITY_PENALTY * unscheduled), routes
 
-        evaluated = self.evaluate(routes, require_complete=True)
+        evaluated = self._evaluate_cost(routes, require_complete=True)
         if not evaluated.feasible:
             return base_fitness + config.BRKGA_INFEASIBILITY_PENALTY, routes
         return evaluated.makespan, routes
@@ -1206,8 +1359,7 @@ class VRPRPDSolver:
         )
 
     def travel_time(self, source: str, target: str) -> float:
-        distance = self.instance.world.distances[source][target]
-        return distance / config.ALVIK_SPEED_IN_PER_SEC
+        return self.travel_times_dense[self.node_index[source]][self.node_index[target]]
 
     def path_coords(self, source: str, target: str) -> List[Tuple[float, float]]:
         node_path = self.instance.world.shortest_paths[(source, target)]

@@ -68,7 +68,9 @@ def main() -> None:
     print(f"  Initial makespan: {result.initial.makespan:.2f}s")
     print(f"  ALNS makespan:    {result.alns.makespan:.2f}s")
     print(f"  BRKGA makespan:   {result.brkga.makespan:.2f}s")
-    print(f"  Using:            {result.best_label}")
+    print(f"  Pipeline mode:    {result.selected_label} (ALNS -> BRKGA)")
+    print(f"  Best stage seen:  {result.best_label}")
+    print(f"  Final used:       {result.best_label}")
 
     if args.headless:
         return

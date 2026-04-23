@@ -11,11 +11,13 @@ from vrp_rpd_sim.world import build_instance
 
 
 class DepotReturnSimulationTests(unittest.TestCase):
+    TEST_JOB_COUNT = 16
+
     def tearDown(self) -> None:
         pygame.quit()
 
     def test_concurrent_depot_return_overlaps(self) -> None:
-        instance = build_instance()
+        instance = build_instance(job_count=self.TEST_JOB_COUNT)
         solver = VRPRPDSolver(instance)
         result = solver.solve()
         app = SimulationApp(instance, solver, result)
@@ -40,7 +42,7 @@ class DepotReturnSimulationTests(unittest.TestCase):
         self.assertTrue(saw_overlap, msg="expected multiple homebound vehicles to move inside the depot together")
 
     def test_full_simulation_returns_every_vehicle_to_the_grid(self) -> None:
-        instance = build_instance()
+        instance = build_instance(job_count=self.TEST_JOB_COUNT)
         solver = VRPRPDSolver(instance)
         result = solver.solve()
         app = SimulationApp(instance, solver, result)

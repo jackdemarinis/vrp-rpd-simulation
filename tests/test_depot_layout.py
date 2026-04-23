@@ -5,12 +5,16 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame
 
+from vrp_rpd_sim import config
+from vrp_rpd_sim.model import Operation
 from vrp_rpd_sim.render import SimulationApp
 from vrp_rpd_sim.solver import VRPRPDSolver
 from vrp_rpd_sim.world import build_instance, build_world
 
 
 class DepotLayoutTests(unittest.TestCase):
+    TEST_JOB_COUNT = 16
+
     def tearDown(self) -> None:
         pygame.quit()
 
@@ -39,8 +43,55 @@ class DepotLayoutTests(unittest.TestCase):
             right_entries,
         )
 
-    def test_homebound_paths_end_at_assigned_slots(self) -> None:
+    def test_stations_fill_all_road_enclosed_blocks(self) -> None:
+        world, stations = build_world()
+
+        self.assertEqual(36, len(stations))
+        self.assertEqual(
+            ((world.road_xs[0] + world.road_xs[1]) / 2.0, (world.road_ys[0] + world.road_ys[1]) / 2.0),
+            stations[0].coord,
+        )
+        self.assertEqual(
+            ((world.road_xs[5] + world.road_xs[6]) / 2.0, (world.road_ys[5] + world.road_ys[6]) / 2.0),
+            stations[-1].coord,
+        )
+        self.assertTrue(all(station.side == "interior" for station in stations))
+        for station in stations:
+            cx, cy = station.coord
+            self.assertGreater(cx, world.road_xs[0])
+            self.assertLess(cx, world.road_xs[-1])
+            self.assertGreater(cy, world.road_ys[0])
+            self.assertLess(cy, world.road_ys[-1])
+
+    def test_vehicle_capacity_is_four_and_five_drops_are_infeasible(self) -> None:
         instance = build_instance()
+        solver = VRPRPDSolver(instance)
+
+        self.assertEqual(4, config.VEHICLE_CAPACITY)
+        self.assertEqual(4, instance.capacity)
+
+        feasible_customer_ids = instance.active_job_ids[:4]
+        infeasible_customer_ids = instance.active_job_ids[:5]
+
+        feasible_route = [[Operation(customer_id, "D") for customer_id in feasible_customer_ids] + [Operation(customer_id, "P") for customer_id in feasible_customer_ids]]
+        feasible_route.extend([[] for _ in range(instance.vehicle_count - 1)])
+        feasible = solver.evaluate(feasible_route, require_complete=False)
+        self.assertTrue(feasible.feasible, msg=feasible.reason)
+
+        infeasible_route = [[Operation(customer_id, "D") for customer_id in infeasible_customer_ids] + [Operation(customer_id, "P") for customer_id in infeasible_customer_ids]]
+        infeasible_route.extend([[] for _ in range(instance.vehicle_count - 1)])
+        infeasible = solver.evaluate(infeasible_route, require_complete=False)
+        self.assertFalse(infeasible.feasible)
+        self.assertIn("Capacity violation", infeasible.reason)
+
+    def test_default_instance_activates_all_36_stations(self) -> None:
+        instance = build_instance()
+
+        self.assertEqual(36, len(instance.stations))
+        self.assertEqual(36, len(instance.active_job_ids))
+
+    def test_homebound_paths_end_at_assigned_slots(self) -> None:
+        instance = build_instance(job_count=self.TEST_JOB_COUNT)
         solver = VRPRPDSolver(instance)
         result = solver.solve()
         app = SimulationApp(instance, solver, result)
@@ -69,7 +120,7 @@ class DepotLayoutTests(unittest.TestCase):
             self.assertIn(vehicle.depot_entry, path)
 
     def test_corridor_stack_invariant_no_crossover(self) -> None:
-        instance = build_instance()
+        instance = build_instance(job_count=self.TEST_JOB_COUNT)
         solver = VRPRPDSolver(instance)
         result = solver.solve()
         app = SimulationApp(instance, solver, result)
