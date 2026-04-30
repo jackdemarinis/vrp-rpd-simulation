@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Set, Tuple
 
 import pygame
 
 from . import config
 from .model import Instance, Operation
+from .solution_cache import solve_with_solution_cache
 from .solver import SolverRunResult, VRPRPDSolver
 from .world import build_instance
 
@@ -101,19 +102,29 @@ class SimulationApp:
         fixed_processing_time: float | None = None,
         fullscreen: bool | None = None,
         debug_depot: bool = False,
+        cache_config: config.CacheConfig | None = None,
     ) -> None:
         pygame.init()
         pygame.display.set_caption(config.APP_TITLE)
 
         self.instance = instance
         self.solver = solver
+        self.instance_config = instance.instance_config
+        self.solver_config = solver.solver_config
+        self.cache_config = cache_config or config.default_runtime_config().cache
         self.result = result
         self.solution = result.best
 
-        self.fixed_processing_time = fixed_processing_time
+        self.fixed_processing_time = (
+            fixed_processing_time
+            if fixed_processing_time is not None
+            else self.instance_config.fixed_processing_time_sec
+        )
         self.active_job_count = job_count if job_count is not None else len(instance.active_job_ids)
         self.processing_scale = (
-            processing_scale if processing_scale is not None else config.PROCESSING_TIME_SCALE
+            processing_scale
+            if processing_scale is not None
+            else self.instance_config.processing_time_scale
         )
         self.fullscreen = fullscreen if fullscreen is not None else config.START_FULLSCREEN
 
@@ -224,13 +235,21 @@ class SimulationApp:
 
     def _refresh_solution(self, message: str) -> None:
         self.status_message = f"{message}. Solving..."
+        self.instance_config = replace(
+            self.instance_config,
+            active_job_count=self.active_job_count,
+            processing_time_scale=self.processing_scale,
+            fixed_processing_time_sec=self.fixed_processing_time,
+        )
         self.instance = build_instance(
             job_count=self.active_job_count,
             processing_scale=self.processing_scale,
             fixed_processing_time=self.fixed_processing_time,
+            instance_config=self.instance_config,
         )
-        self.solver = VRPRPDSolver(self.instance)
-        self.result = self.solver.solve()
+        self.instance_config = self.instance.instance_config
+        self.solver = VRPRPDSolver(self.instance, solver_config=self.solver_config)
+        self.result, _, _ = solve_with_solution_cache(self.solver, self.cache_config)
         self.solution = self.result.best
         self._reset_simulation()
         self.status_message = message
@@ -617,7 +636,7 @@ class SimulationApp:
                 vehicle.completion_time = self.sim_time
 
     def _advance_vehicles(self, step: float) -> None:
-        max_distance = config.ALVIK_SPEED_IN_PER_SEC * step
+        max_distance = self.instance.instance_config.alvik_speed_in_per_sec * step
         proposed_positions = {
             vehicle.vehicle_id: vehicle.position
             for vehicle in self.vehicles
@@ -1189,7 +1208,10 @@ class SimulationApp:
         y = hud_rect.y + 24
         lines = [
             ("VRP-RPD", self.font_large),
-            (f"Alvik speed: {config.ALVIK_SPEED_IN_PER_SEC * 2.54:.1f} cm/s", self.font),
+            (
+                f"Alvik speed: {self.instance.instance_config.alvik_speed_in_per_sec * 2.54:.1f} cm/s",
+                self.font,
+            ),
             (f"Active jobs: {len(self.instance.active_job_ids)} / {len(self.instance.stations)}", self.font),
             (f"Process scale: {self.processing_scale:.2f}x", self.font),
             ("", self.font),

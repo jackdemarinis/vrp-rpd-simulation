@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
+
+if TYPE_CHECKING:
+    from .config import InstanceConfig
 
 Coord = Tuple[float, float]
 Route = List["Operation"]
@@ -52,6 +55,7 @@ class Instance:
     vehicle_count: int
     capacity: int
     processing_times: Dict[int, float]
+    instance_config: "InstanceConfig"
     depot_node: str = "depot"
     station_by_id: Dict[int, Station] = field(init=False)
 

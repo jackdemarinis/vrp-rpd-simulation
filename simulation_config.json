@@ -1,0 +1,52 @@
+{
+  "instance": {
+    "active_job_count": 36,
+    "vehicle_count": 9,
+    "vehicle_capacity": 4,
+    "alvik_speed_in_per_sec": 5.118110236220472,
+    "processing_time_variant": "base",
+    "processing_time_seed": 7,
+    "processing_time_scale": 1.0,
+    "fixed_processing_time_sec": null,
+    "processing_time_overrides": {}
+  },
+  "solver": {
+    "random_seed": 7,
+    "alns_max_iterations": 8,
+    "alns_initial_temperature_coeff": 0.3,
+    "alns_cooling_rate": 0.9998,
+    "alns_reheat_factor": 0.5,
+    "alns_stagnation_threshold": 2000,
+    "alns_weight_update_interval": 100,
+    "alns_reaction_factor": 0.1,
+    "alns_pickup_reposition_interval": 200,
+    "alns_cross_agent_relocate_interval": 500,
+    "alns_score_sigma_1": 33,
+    "alns_score_sigma_2": 9,
+    "alns_score_sigma_3": 13,
+    "alns_min_operator_weight": 0.1,
+    "alns_worst_removal_power": 6,
+    "alns_shaw_phi": 9,
+    "alns_shaw_chi": 3,
+    "alns_shaw_omega": 5,
+    "brkga_population_size": 36,
+    "brkga_elite_proportion": 0.15,
+    "brkga_mutant_proportion": 0.15,
+    "brkga_elite_bias": 0.7,
+    "brkga_generations": 24,
+    "brkga_warm_start_proportion": 0.15,
+    "brkga_warm_seed_count": 8,
+    "brkga_gene_perturbation": 0.03,
+    "brkga_infeasibility_penalty": 1000000.0
+  },
+  "app": {
+    "sim_speed_multiplier": 6.0,
+    "start_fullscreen": false
+  },
+  "cache": {
+    "enabled": true,
+    "directory": ".solution_cache",
+    "schema_version": 1,
+    "algorithm_version": "2026-04-30"
+  }
+}

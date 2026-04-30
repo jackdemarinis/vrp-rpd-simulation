@@ -6,6 +6,7 @@ import heapq
 import math
 import random
 from collections import defaultdict
+from dataclasses import replace
 from typing import Dict, Iterable, List, Tuple
 
 from . import config
@@ -16,22 +17,45 @@ def build_instance(
     job_count: int | None = None,
     processing_scale: float | None = None,
     fixed_processing_time: float | None = None,
+    instance_config: config.InstanceConfig | None = None,
 ) -> Instance:
+    instance_config = instance_config or config.default_runtime_config().instance
+    resolved_job_count = (
+        instance_config.active_job_count if job_count is None else job_count
+    )
+    resolved_processing_scale = (
+        instance_config.processing_time_scale
+        if processing_scale is None
+        else processing_scale
+    )
+    resolved_fixed_processing_time = (
+        instance_config.fixed_processing_time_sec
+        if fixed_processing_time is None
+        else fixed_processing_time
+    )
+    resolved_instance_config = replace(
+        instance_config,
+        active_job_count=resolved_job_count,
+        processing_time_scale=resolved_processing_scale,
+        fixed_processing_time_sec=resolved_fixed_processing_time,
+    )
     world, stations = build_world()
     processing_times = build_processing_times(
         world,
         stations,
-        processing_scale=processing_scale,
-        fixed_processing_time=fixed_processing_time,
+        processing_scale=resolved_processing_scale,
+        fixed_processing_time=resolved_fixed_processing_time,
+        instance_config=resolved_instance_config,
     )
-    active_job_ids = select_active_job_ids(stations, job_count or config.ACTIVE_JOB_COUNT)
+    active_job_ids = select_active_job_ids(stations, resolved_job_count)
     return Instance(
         world=world,
         stations=stations,
         active_job_ids=active_job_ids,
-        vehicle_count=config.ALVIK_COUNT,
-        capacity=config.VEHICLE_CAPACITY,
+        vehicle_count=resolved_instance_config.vehicle_count,
+        capacity=resolved_instance_config.vehicle_capacity,
         processing_times=processing_times,
+        instance_config=resolved_instance_config,
     )
 
 
@@ -126,7 +150,9 @@ def build_processing_times(
     stations: Iterable[Station],
     processing_scale: float | None = None,
     fixed_processing_time: float | None = None,
+    instance_config: config.InstanceConfig | None = None,
 ) -> Dict[int, float]:
+    instance_config = instance_config or config.default_runtime_config().instance
     station_list = list(stations)
     travel_values = []
     for station_a in station_list:
@@ -134,22 +160,26 @@ def build_processing_times(
             if station_a.station_id >= station_b.station_id:
                 continue
             distance = world.distances[station_a.node_id][station_b.node_id]
-            travel_values.append(distance / config.ALVIK_SPEED_IN_PER_SEC)
+            travel_values.append(distance / instance_config.alvik_speed_in_per_sec)
     d_min = min(travel_values)
     d_max = max(travel_values)
 
-    rng = random.Random(config.PROCESSING_TIME_SEED)
+    rng = random.Random(instance_config.processing_time_seed)
     base_times = {
         station.station_id: rng.uniform(d_min, d_max) for station in station_list
     }
 
-    override_fixed = config.FIXED_PROCESSING_TIME_SEC if fixed_processing_time is None else fixed_processing_time
+    override_fixed = (
+        instance_config.fixed_processing_time_sec
+        if fixed_processing_time is None
+        else fixed_processing_time
+    )
     if override_fixed is not None:
         processing_times = {
             station.station_id: float(override_fixed) for station in station_list
         }
     else:
-        variant = config.PROCESSING_TIME_VARIANT.lower()
+        variant = instance_config.processing_time_variant.lower()
         if variant == "base":
             processing_times = dict(base_times)
         elif variant == "2x":
@@ -165,14 +195,16 @@ def build_processing_times(
                 station_id: value * rng.randint(1, 20) for station_id, value in base_times.items()
             }
         else:
-            raise ValueError(f"Unsupported processing-time variant: {config.PROCESSING_TIME_VARIANT}")
+            raise ValueError(
+                f"Unsupported processing-time variant: {instance_config.processing_time_variant}"
+            )
 
-    scale = config.PROCESSING_TIME_SCALE if processing_scale is None else processing_scale
+    scale = instance_config.processing_time_scale if processing_scale is None else processing_scale
     processing_times = {
         station_id: value * scale for station_id, value in processing_times.items()
     }
 
-    processing_times.update(config.PROCESSING_TIME_OVERRIDES)
+    processing_times.update(instance_config.processing_time_overrides)
     return processing_times
 
 

@@ -39,9 +39,15 @@ class QuickEvaluation:
 class VRPRPDSolver:
     """CPU implementation of the paper's ALNS -> BRKGA pipeline."""
 
-    def __init__(self, instance: Instance) -> None:
+    def __init__(
+        self,
+        instance: Instance,
+        solver_config: config.SolverConfig | None = None,
+    ) -> None:
         self.instance = instance
-        self.rng = random.Random(config.SOLVER_RANDOM_SEED)
+        self.solver_config = solver_config or config.default_runtime_config().solver
+        self.speed_in_per_sec = self.instance.instance_config.alvik_speed_in_per_sec
+        self.rng = random.Random(self.solver_config.random_seed)
         self.customers = list(self.instance.active_job_ids)
         self.customer_set = set(self.customers)
         self.customer_index = {
@@ -78,7 +84,7 @@ class VRPRPDSolver:
             for target, distance in targets.items():
                 target_index = self.node_index[target]
                 self.travel_times_dense[source_index][target_index] = (
-                    distance / config.ALVIK_SPEED_IN_PER_SEC
+                    distance / self.speed_in_per_sec
                 )
 
         self.destroy_names = [
@@ -550,11 +556,11 @@ class VRPRPDSolver:
         destroy_attempts = {name: 0 for name in self.destroy_names}
         repair_attempts = {name: 0 for name in self.repair_names}
 
-        temperature_init = config.ALNS_INITIAL_TEMPERATURE_COEFF * best_eval.makespan
+        temperature_init = self.solver_config.alns_initial_temperature_coeff * best_eval.makespan
         temperature = temperature_init
         stagnation = 0
 
-        for iteration in range(1, config.ALNS_MAX_ITERATIONS + 1):
+        for iteration in range(1, self.solver_config.alns_max_iterations + 1):
             destroy_name = self._weighted_choice(destroy_weights)
             repair_name = self._weighted_choice(repair_weights)
             destroy_attempts[destroy_name] += 1
@@ -578,17 +584,19 @@ class VRPRPDSolver:
                     candidate_eval = self.evaluate(candidate_routes, require_complete=True)
                 current_routes = candidate_routes
                 current_eval = candidate_eval
-                destroy_scores[destroy_name] += config.ALNS_SCORE_SIGMA_2
-                repair_scores[repair_name] += config.ALNS_SCORE_SIGMA_2
+                destroy_scores[destroy_name] += self.solver_config.alns_score_sigma_2
+                repair_scores[repair_name] += self.solver_config.alns_score_sigma_2
                 accepted = True
                 if candidate_makespan < best_eval.makespan:
                     best_routes = clone_routes(candidate_routes)
                     best_eval = candidate_eval
                     destroy_scores[destroy_name] += (
-                        config.ALNS_SCORE_SIGMA_1 - config.ALNS_SCORE_SIGMA_2
+                        self.solver_config.alns_score_sigma_1
+                        - self.solver_config.alns_score_sigma_2
                     )
                     repair_scores[repair_name] += (
-                        config.ALNS_SCORE_SIGMA_1 - config.ALNS_SCORE_SIGMA_2
+                        self.solver_config.alns_score_sigma_1
+                        - self.solver_config.alns_score_sigma_2
                     )
                     stagnation = 0
             else:
@@ -598,24 +606,24 @@ class VRPRPDSolver:
                         candidate_eval = self.evaluate(candidate_routes, require_complete=True)
                     current_routes = candidate_routes
                     current_eval = candidate_eval
-                    destroy_scores[destroy_name] += config.ALNS_SCORE_SIGMA_3
-                    repair_scores[repair_name] += config.ALNS_SCORE_SIGMA_3
+                    destroy_scores[destroy_name] += self.solver_config.alns_score_sigma_3
+                    repair_scores[repair_name] += self.solver_config.alns_score_sigma_3
                     accepted = True
 
-            temperature *= config.ALNS_COOLING_RATE
+            temperature *= self.solver_config.alns_cooling_rate
             if accepted and candidate_eval.makespan < best_eval.makespan:
                 stagnation = 0
             else:
                 stagnation += 1
 
             if (
-                stagnation >= config.ALNS_STAGNATION_THRESHOLD
+                stagnation >= self.solver_config.alns_stagnation_threshold
                 and temperature < (0.01 * temperature_init)
             ):
-                temperature = config.ALNS_REHEAT_FACTOR * temperature_init
+                temperature = self.solver_config.alns_reheat_factor * temperature_init
                 stagnation = 0
 
-            if iteration % config.ALNS_PICKUP_REPOSITION_INTERVAL == 0:
+            if iteration % self.solver_config.alns_pickup_reposition_interval == 0:
                 current_routes, changed = self._pickup_reposition_pass(current_routes, max_passes=3)
                 if changed:
                     current_eval = self.evaluate(current_routes, require_complete=True)
@@ -623,7 +631,7 @@ class VRPRPDSolver:
                         best_routes = clone_routes(current_routes)
                         best_eval = current_eval
 
-            if iteration % config.ALNS_CROSS_AGENT_RELOCATE_INTERVAL == 0:
+            if iteration % self.solver_config.alns_cross_agent_relocate_interval == 0:
                 current_routes, changed = self._cross_agent_relocation_pass(current_routes, max_passes=3)
                 if changed:
                     current_eval = self.evaluate(current_routes, require_complete=True)
@@ -631,14 +639,17 @@ class VRPRPDSolver:
                         best_routes = clone_routes(current_routes)
                         best_eval = current_eval
 
-            if iteration % config.ALNS_WEIGHT_UPDATE_INTERVAL == 0:
+            if iteration % self.solver_config.alns_weight_update_interval == 0:
                 for name in self.destroy_names:
                     if destroy_attempts[name]:
                         destroy_weights[name] = max(
-                            config.ALNS_MIN_OPERATOR_WEIGHT,
-                            ((1.0 - config.ALNS_REACTION_FACTOR) * destroy_weights[name])
+                            self.solver_config.alns_min_operator_weight,
+                            (
+                                (1.0 - self.solver_config.alns_reaction_factor)
+                                * destroy_weights[name]
+                            )
                             + (
-                                config.ALNS_REACTION_FACTOR
+                                self.solver_config.alns_reaction_factor
                                 * (destroy_scores[name] / destroy_attempts[name])
                             ),
                         )
@@ -647,10 +658,13 @@ class VRPRPDSolver:
                 for name in self.repair_names:
                     if repair_attempts[name]:
                         repair_weights[name] = max(
-                            config.ALNS_MIN_OPERATOR_WEIGHT,
-                            ((1.0 - config.ALNS_REACTION_FACTOR) * repair_weights[name])
+                            self.solver_config.alns_min_operator_weight,
+                            (
+                                (1.0 - self.solver_config.alns_reaction_factor)
+                                * repair_weights[name]
+                            )
                             + (
-                                config.ALNS_REACTION_FACTOR
+                                self.solver_config.alns_reaction_factor
                                 * (repair_scores[name] / repair_attempts[name])
                             ),
                         )
@@ -709,7 +723,7 @@ class VRPRPDSolver:
         removed = []
         while ranked and len(removed) < q:
             weights = [
-                1.0 / ((rank + 1) ** config.ALNS_WORST_REMOVAL_POWER)
+            1.0 / ((rank + 1) ** self.solver_config.alns_worst_removal_power)
                 for rank in range(len(ranked))
             ]
             chosen = self.rng.choices(ranked, weights=weights, k=1)[0]
@@ -808,12 +822,12 @@ class VRPRPDSolver:
         )
         agent_mismatch = 0.0
         if evaluation.drop_vehicle.get(customer_a) != evaluation.drop_vehicle.get(customer_b):
-            agent_mismatch += config.ALNS_SHAW_OMEGA / 2.0
+                    agent_mismatch += self.solver_config.alns_shaw_omega / 2.0
         if evaluation.pickup_vehicle.get(customer_a) != evaluation.pickup_vehicle.get(customer_b):
-            agent_mismatch += config.ALNS_SHAW_OMEGA / 2.0
+                    agent_mismatch += self.solver_config.alns_shaw_omega / 2.0
         return (
-            (config.ALNS_SHAW_PHI * distance)
-            + (config.ALNS_SHAW_CHI * time_gap)
+                    (self.solver_config.alns_shaw_phi * distance)
+                    + (self.solver_config.alns_shaw_chi * time_gap)
             + agent_mismatch
         )
 
@@ -1049,12 +1063,24 @@ class VRPRPDSolver:
 
     def run_brkga(self, alns_routes: Routes) -> Tuple[Routes, EvaluatedSolution]:
         population = self._build_initial_population(alns_routes)
-        elite_count = max(1, int(config.BRKGA_ELITE_PROPORTION * config.BRKGA_POPULATION_SIZE))
-        mutant_count = max(1, int(config.BRKGA_MUTANT_PROPORTION * config.BRKGA_POPULATION_SIZE))
+        elite_count = max(
+            1,
+            int(
+                self.solver_config.brkga_elite_proportion
+                * self.solver_config.brkga_population_size
+            ),
+        )
+        mutant_count = max(
+            1,
+            int(
+                self.solver_config.brkga_mutant_proportion
+                * self.solver_config.brkga_population_size
+            ),
+        )
 
         best_chromosome = None
         best_eval = None
-        for _ in range(config.BRKGA_GENERATIONS):
+        for _ in range(self.solver_config.brkga_generations):
             for chromosome in population:
                 if chromosome.fitness is None:
                     chromosome.fitness, chromosome.routes = self._decode_chromosome(chromosome)
@@ -1081,7 +1107,7 @@ class VRPRPDSolver:
             for _ in range(mutant_count):
                 next_population.append(self._random_chromosome())
 
-            while len(next_population) < config.BRKGA_POPULATION_SIZE:
+            while len(next_population) < self.solver_config.brkga_population_size:
                 elite_parent = self.rng.choice(elites)
                 non_elite_parent = self.rng.choice(non_elites)
                 child_priority = []
@@ -1089,14 +1115,14 @@ class VRPRPDSolver:
                 for elite_gene, non_elite_gene in zip(
                     elite_parent.priority_genes, non_elite_parent.priority_genes
                 ):
-                    if self.rng.random() < config.BRKGA_ELITE_BIAS:
+                    if self.rng.random() < self.solver_config.brkga_elite_bias:
                         child_priority.append(elite_gene)
                     else:
                         child_priority.append(non_elite_gene)
                 for elite_gene, non_elite_gene in zip(
                     elite_parent.assignment_genes, non_elite_parent.assignment_genes
                 ):
-                    if self.rng.random() < config.BRKGA_ELITE_BIAS:
+                    if self.rng.random() < self.solver_config.brkga_elite_bias:
                         child_assignment.append(elite_gene)
                     else:
                         child_assignment.append(non_elite_gene)
@@ -1115,7 +1141,13 @@ class VRPRPDSolver:
 
     def _build_initial_population(self, alns_routes: Routes) -> List[Chromosome]:
         population: List[Chromosome] = []
-        warm_count = max(1, int(config.BRKGA_WARM_START_PROPORTION * config.BRKGA_POPULATION_SIZE))
+        warm_count = max(
+            1,
+            int(
+                self.solver_config.brkga_warm_start_proportion
+                * self.solver_config.brkga_population_size
+            ),
+        )
 
         seed_routes = [
             alns_routes,
@@ -1124,7 +1156,7 @@ class VRPRPDSolver:
             self._heuristic_spt(),
         ]
         seeded = 0
-        while seeded < min(config.BRKGA_WARM_SEED_COUNT, warm_count):
+        while seeded < min(self.solver_config.brkga_warm_seed_count, warm_count):
             source = seed_routes[seeded % len(seed_routes)]
             chromosome = self._encode_solution(source)
             chromosome = self._perturb_chromosome(chromosome)
@@ -1132,7 +1164,7 @@ class VRPRPDSolver:
             population.append(chromosome)
             seeded += 1
 
-        while len(population) < config.BRKGA_POPULATION_SIZE:
+        while len(population) < self.solver_config.brkga_population_size:
             population.append(self._random_chromosome())
 
         return population
@@ -1231,11 +1263,15 @@ class VRPRPDSolver:
         )
         unscheduled = scheduled.count(False)
         if unscheduled:
-            return base_fitness + (config.BRKGA_INFEASIBILITY_PENALTY * unscheduled), routes
+            return (
+                base_fitness
+                + (self.solver_config.brkga_infeasibility_penalty * unscheduled),
+                routes,
+            )
 
         evaluated = self._evaluate_cost(routes, require_complete=True)
         if not evaluated.feasible:
-            return base_fitness + config.BRKGA_INFEASIBILITY_PENALTY, routes
+            return base_fitness + self.solver_config.brkga_infeasibility_penalty, routes
         return evaluated.makespan, routes
 
     def _decoder_completion_time(
@@ -1273,13 +1309,21 @@ class VRPRPDSolver:
     def _perturb_chromosome(self, chromosome: Chromosome) -> Chromosome:
         perturbed_priority = [
             clamp01(
-                gene + self.rng.uniform(-config.BRKGA_GENE_PERTURBATION, config.BRKGA_GENE_PERTURBATION)
+                gene
+                + self.rng.uniform(
+                    -self.solver_config.brkga_gene_perturbation,
+                    self.solver_config.brkga_gene_perturbation,
+                )
             )
             for gene in chromosome.priority_genes
         ]
         perturbed_assignment = [
             clamp01(
-                gene + self.rng.uniform(-config.BRKGA_GENE_PERTURBATION, config.BRKGA_GENE_PERTURBATION)
+                gene
+                + self.rng.uniform(
+                    -self.solver_config.brkga_gene_perturbation,
+                    self.solver_config.brkga_gene_perturbation,
+                )
             )
             for gene in chromosome.assignment_genes
         ]
