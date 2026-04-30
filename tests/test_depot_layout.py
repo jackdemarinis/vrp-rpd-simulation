@@ -104,9 +104,14 @@ class DepotLayoutTests(unittest.TestCase):
             vehicle.route_index = len(vehicle.route)
             vehicle.active_path = None
 
-        app._assign_return_targets()
-
-        for vehicle in active_vehicles[:3]:
+        assigned_slots = []
+        for _ in range(3):
+            app._assign_return_targets()
+            vehicle = next(
+                vehicle
+                for vehicle in active_vehicles
+                if vehicle.return_slot_index is not None and not vehicle.completed
+            )
             path = app._travel_points(
                 vehicle.position,
                 vehicle.current_node,
@@ -118,6 +123,10 @@ class DepotLayoutTests(unittest.TestCase):
             )
             self.assertEqual(vehicle.home_slot, path[-1])
             self.assertIn(vehicle.depot_entry, path)
+            assigned_slots.append(vehicle.home_slot)
+            vehicle.completed = True
+
+        self.assertEqual(app.depot_return_slots[:3], assigned_slots)
 
     def test_corridor_stack_invariant_no_crossover(self) -> None:
         instance = build_instance(job_count=self.TEST_JOB_COUNT)

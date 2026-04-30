@@ -47,6 +47,9 @@ TEXT_LIGHT = (240, 243, 246)
 SLIDER_TRACK = (87, 97, 109)
 SLIDER_FILL = (88, 184, 125)
 SLIDER_KNOB = (245, 247, 249)
+DEPARTURE_STAGGER_SECONDS = 1.0
+RESOURCE_ROUND_DIGITS = 3
+INTERSECTION_PRIORITY = {"N": 0, "E": 1, "S": 2, "W": 3}
 
 
 @dataclass
@@ -83,7 +86,7 @@ class VehicleState:
     return_slot_index: int | None = None
     depot_entry: Coord | None = None
     depot_corridor: str | None = None
-    launch_time: float = 0.0
+    departure_release_time: float = 0.0
 
     def load_marker(self) -> int:
         return self.load
@@ -351,7 +354,9 @@ class SimulationApp:
                     position=home_slot,
                     load=self.instance.capacity,
                     return_slot_index=return_slot_index,
-                    launch_time=launch_order.get(vehicle_id, 0) * 8.0,
+                    departure_release_time=(
+                        launch_order.get(vehicle_id, 0) * DEPARTURE_STAGGER_SECONDS
+                    ),
                 )
             )
         return vehicles
@@ -398,6 +403,26 @@ class SimulationApp:
     def _is_homebound(self, vehicle: VehicleState) -> bool:
         return vehicle.route_index >= len(vehicle.route) and not vehicle.completed
 
+    def _depot_departure_apron_occupied(self, *, exclude_vehicle_id: int | None = None) -> bool:
+        for vehicle in self.vehicles:
+            if vehicle.vehicle_id == exclude_vehicle_id:
+                continue
+            if vehicle.completed or vehicle.route_index >= len(vehicle.route):
+                continue
+            if vehicle.active_path is None:
+                continue
+            if vehicle.current_node == self.instance.depot_node:
+                return True
+        return False
+
+    def _has_pending_depot_departures(self) -> bool:
+        return any(
+            vehicle.route
+            and vehicle.route_index == 0
+            and vehicle.current_node == self.instance.depot_node
+            for vehicle in self.vehicles
+        )
+
     def _refresh_corridor_frontier(self) -> None:
         self.corridor_next_slot = {}
         for corridor_id, slots in self.depot_corridor_slots.items():
@@ -408,130 +433,70 @@ class SimulationApp:
                     break
             self.corridor_next_slot[corridor_id] = next_slot
 
-    def _available_return_candidates(self) -> List[Tuple[str, Coord]]:
-        candidates: List[Tuple[str, Coord]] = []
-        for corridor_id in sorted(self.corridor_next_slot):
-            slot = self.corridor_next_slot[corridor_id]
-            if slot is not None:
-                candidates.append((corridor_id, slot))
-        return candidates
-
     def _assign_return_targets(self) -> None:
-        unassigned = [
-            vehicle
+        if any(
+            vehicle.route
+            and self._is_homebound(vehicle)
+            and vehicle.return_slot_index is not None
             for vehicle in self.vehicles
-            if self._is_homebound(vehicle) and vehicle.return_slot_index is None
-        ]
-        while unassigned:
-            candidates = self._available_return_candidates()
-            if not candidates:
-                raise RuntimeError("No available depot return slot.")
-            assignments = self._best_return_assignments(unassigned, candidates)
-            if not assignments:
-                raise RuntimeError("No depot return assignment found.")
+        ):
+            return
 
-            for vehicle_index, candidate_index in assignments:
-                vehicle = unassigned[vehicle_index]
-                corridor_id, slot = candidates[candidate_index]
-                vehicle.home_slot = slot
-                vehicle.return_slot_index = self.depot_return_slot_ranks[slot]
-                vehicle.depot_entry = self.depot_corridor_entries[corridor_id]
-                vehicle.depot_corridor = corridor_id
-                self.reserved_return_slots.add(slot)
-                self._debug_depot_message(
-                    f"assign V{vehicle.vehicle_id + 1} to {corridor_id} slot {vehicle.return_slot_index + 1} "
-                    f"at {tuple(round(value, 2) for value in slot)}"
-                )
-
-            self._refresh_corridor_frontier()
+        while True:
             unassigned = [
                 vehicle
                 for vehicle in self.vehicles
                 if self._is_homebound(vehicle) and vehicle.return_slot_index is None
             ]
+            if not unassigned:
+                return
 
-    def _best_return_assignments(
-        self,
-        vehicles: List[VehicleState],
-        candidates: List[Tuple[str, Coord]],
-    ) -> List[Tuple[int, int]]:
-        vehicle_count = len(vehicles)
-        candidate_count = len(candidates)
-        cost_matrix = [
-            [self._return_candidate_cost(vehicle, corridor_id, slot) for corridor_id, slot in candidates]
-            for vehicle in vehicles
+            slot = self._next_return_slot()
+            if slot is None:
+                raise RuntimeError("No available depot return slot.")
+
+            vehicle = min(unassigned, key=self._return_assignment_order)
+            corridor_id = self._best_corridor_for_return_slot(vehicle, slot)
+            vehicle.home_slot = slot
+            vehicle.return_slot_index = self.depot_return_slot_ranks[slot]
+            vehicle.depot_entry = self.depot_corridor_entries[corridor_id]
+            vehicle.depot_corridor = corridor_id
+            self.reserved_return_slots.add(slot)
+            self._debug_depot_message(
+                f"assign V{vehicle.vehicle_id + 1} to {corridor_id} slot {vehicle.return_slot_index + 1} "
+                f"at {tuple(round(value, 2) for value in slot)}"
+            )
+            self._refresh_corridor_frontier()
+            return
+
+    def _next_return_slot(self) -> Coord | None:
+        for slot in self.depot_return_slots:
+            if slot not in self.reserved_return_slots:
+                return slot
+        return None
+
+    def _return_assignment_order(self, vehicle: VehicleState) -> Tuple[float, int]:
+        if vehicle.current_node == self.instance.depot_node:
+            return 0.0, vehicle.vehicle_id
+        return (
+            polyline_length(self.solver.path_coords(vehicle.current_node, self.instance.depot_node)),
+            vehicle.vehicle_id,
+        )
+
+    def _best_corridor_for_return_slot(self, vehicle: VehicleState, slot: Coord) -> str:
+        corridors = [
+            corridor_id
+            for corridor_id in self.slot_corridors.get(slot, [])
+            if self.corridor_next_slot.get(corridor_id) == slot
         ]
-
-        if vehicle_count <= candidate_count:
-            memo: Dict[Tuple[int, int], float] = {}
-            choice: Dict[Tuple[int, int], int] = {}
-
-            def solve(vehicle_index: int, used_mask: int) -> float:
-                key = (vehicle_index, used_mask)
-                if key in memo:
-                    return memo[key]
-                if vehicle_index >= vehicle_count:
-                    return 0.0
-
-                best_cost = math.inf
-                best_candidate = -1
-                for candidate_index in range(candidate_count):
-                    if used_mask & (1 << candidate_index):
-                        continue
-                    candidate_cost = cost_matrix[vehicle_index][candidate_index] + solve(
-                        vehicle_index + 1,
-                        used_mask | (1 << candidate_index),
-                    )
-                    if candidate_cost < best_cost - 1e-9:
-                        best_cost = candidate_cost
-                        best_candidate = candidate_index
-                memo[key] = best_cost
-                choice[key] = best_candidate
-                return best_cost
-
-            solve(0, 0)
-            assignments = []
-            used_mask = 0
-            for vehicle_index in range(vehicle_count):
-                candidate_index = choice[(vehicle_index, used_mask)]
-                assignments.append((vehicle_index, candidate_index))
-                used_mask |= 1 << candidate_index
-            return assignments
-
-        memo = {}
-        choice = {}
-
-        def solve(candidate_index: int, used_mask: int) -> float:
-            key = (candidate_index, used_mask)
-            if key in memo:
-                return memo[key]
-            if candidate_index >= candidate_count:
-                return 0.0
-
-            best_cost = math.inf
-            best_vehicle = -1
-            for vehicle_index in range(vehicle_count):
-                if used_mask & (1 << vehicle_index):
-                    continue
-                candidate_cost = cost_matrix[vehicle_index][candidate_index] + solve(
-                    candidate_index + 1,
-                    used_mask | (1 << vehicle_index),
-                )
-                if candidate_cost < best_cost - 1e-9:
-                    best_cost = candidate_cost
-                    best_vehicle = vehicle_index
-            memo[key] = best_cost
-            choice[key] = best_vehicle
-            return best_cost
-
-        solve(0, 0)
-        assignments = []
-        used_mask = 0
-        for candidate_index in range(candidate_count):
-            vehicle_index = choice[(candidate_index, used_mask)]
-            assignments.append((vehicle_index, candidate_index))
-            used_mask |= 1 << vehicle_index
-        return assignments
+        if not corridors:
+            corridors = list(self.slot_corridors.get(slot, []))
+        if not corridors:
+            raise RuntimeError(f"No depot corridor reaches return slot {slot}.")
+        return min(
+            corridors,
+            key=lambda corridor_id: self._return_candidate_cost(vehicle, corridor_id, slot),
+        )
 
     def _return_candidate_cost(
         self,
@@ -593,7 +558,13 @@ class SimulationApp:
                 if (
                     vehicle.route_index == 0
                     and vehicle.current_node == self.instance.depot_node
-                    and self.sim_time < vehicle.launch_time
+                    and self.sim_time < vehicle.departure_release_time
+                ):
+                    continue
+                if (
+                    vehicle.route_index == 0
+                    and vehicle.current_node == self.instance.depot_node
+                    and self._depot_departure_apron_occupied(exclude_vehicle_id=vehicle.vehicle_id)
                 ):
                     continue
                 op = vehicle.route[vehicle.route_index]
@@ -608,7 +579,15 @@ class SimulationApp:
             if vehicle.return_slot_index is None:
                 self._assign_return_targets()
             if vehicle.return_slot_index is None:
-                raise RuntimeError(f"Missing depot return target for vehicle {vehicle.vehicle_id}.")
+                continue
+            if (
+                vehicle.current_node != self.instance.depot_node
+                and (
+                    self._has_pending_depot_departures()
+                    or self._depot_departure_apron_occupied(exclude_vehicle_id=vehicle.vehicle_id)
+                )
+            ):
+                continue
             if (
                 vehicle.current_node != self.instance.depot_node
                 or euclidean(vehicle.position, vehicle.home_slot) > 1e-6
@@ -637,159 +616,373 @@ class SimulationApp:
 
     def _advance_vehicles(self, step: float) -> None:
         max_distance = self.instance.instance_config.alvik_speed_in_per_sec * step
-        proposed_positions = {
+        current_owners = self._current_resource_owners()
+        planned_owners: Dict[str, int] = {}
+        current_positions = {
             vehicle.vehicle_id: vehicle.position
             for vehicle in self.vehicles
             if not vehicle.completed
         }
-        proposed_sweeps = {
-            vehicle.vehicle_id: [vehicle.position] * 7
-            for vehicle in self.vehicles
-            if not vehicle.completed
-        }
+        planned_positions: Dict[int, Coord] = {}
         movable = [
             vehicle
             for vehicle in self.vehicles
             if not vehicle.completed and vehicle.waiting_customer_id is None and vehicle.active_path is not None
         ]
-        movable.sort(
-            key=lambda vehicle: (
-                0.0 if vehicle.active_path is None else vehicle.active_path.distance,
-                1 if self._is_homebound(vehicle) else 0,
-                vehicle.route_index,
-                -vehicle.vehicle_id,
-            ),
-            reverse=True,
-        )
+        intersection_winners = self._intersection_winners(movable, max_distance, current_owners)
+        movable.sort(key=self._movement_priority, reverse=True)
 
         for vehicle in movable:
             path = vehicle.active_path
             if path is None:
+                continue
+            if path.total_length - path.distance <= 1e-5:
+                path.distance = path.total_length
+                vehicle.position = path.position()
                 continue
             travel = min(max_distance, path.total_length - path.distance)
             if travel <= 0:
                 continue
 
             start_distance = path.distance
-            allowed = self._max_safe_travel(vehicle, travel, proposed_positions, proposed_sweeps)
-            if allowed <= 1e-5:
-                proposed_sweeps[vehicle.vehicle_id] = self._sample_motion(path, start_distance, start_distance)
-                continue
-            path.distance += allowed
-            vehicle.position = path.position()
-            proposed_positions[vehicle.vehicle_id] = vehicle.position
-            proposed_sweeps[vehicle.vehicle_id] = self._sample_motion(
-                path,
-                start_distance,
-                path.distance,
+            allowed = self._max_resource_safe_travel(
+                vehicle,
+                travel,
+                current_owners,
+                planned_owners,
+                current_positions,
+                planned_positions,
+                intersection_winners,
             )
+            if allowed <= 1e-6:
+                continue
 
-    def _max_safe_travel(
+            end_distance = start_distance + allowed
+            movement_resources = self._resources_for_path_range(path, start_distance, end_distance)
+            self._reserve_resources(planned_owners, vehicle.vehicle_id, movement_resources)
+            path.distance = end_distance
+            vehicle.position = path.position()
+            planned_positions[vehicle.vehicle_id] = vehicle.position
+
+    def _max_resource_safe_travel(
         self,
         vehicle: VehicleState,
-        travel: float,
-        proposed_positions: Dict[int, Coord],
-        proposed_sweeps: Dict[int, List[Coord]],
+        requested_travel: float,
+        current_owners: Dict[str, int],
+        planned_owners: Dict[str, int],
+        current_positions: Dict[int, Coord],
+        planned_positions: Dict[int, Coord],
+        intersection_winners: Dict[str, int],
     ) -> float:
         path = vehicle.active_path
         if path is None:
             return 0.0
 
-        low = 0.0
-        high = travel
-        if self._is_safe_motion(
+        start_distance = path.distance
+        requested_end = min(path.total_length, start_distance + requested_travel)
+        owned_now = self._vehicle_current_resources(vehicle)
+        if self._resource_motion_allowed(
             vehicle.vehicle_id,
-            self._sample_motion(path, path.distance, path.distance + high),
-            proposed_positions,
-            proposed_sweeps,
+            path,
+            start_distance,
+            requested_end,
+            owned_now,
+            current_owners,
+            planned_owners,
+            current_positions,
+            planned_positions,
+            intersection_winners,
         ):
-            return high
+            return requested_end - start_distance
 
+        low = start_distance
+        high = requested_end
         for _ in range(14):
             mid = (low + high) / 2.0
-            candidate = self._sample_motion(path, path.distance, path.distance + mid)
-            if self._is_safe_motion(
+            if self._resource_motion_allowed(
                 vehicle.vehicle_id,
-                candidate,
-                proposed_positions,
-                proposed_sweeps,
+                path,
+                start_distance,
+                mid,
+                owned_now,
+                current_owners,
+                planned_owners,
+                current_positions,
+                planned_positions,
+                intersection_winners,
             ):
                 low = mid
             else:
                 high = mid
-        return low
+        return max(0.0, low - start_distance)
 
-    def _is_safe_motion(
+    def _resource_motion_allowed(
         self,
         vehicle_id: int,
-        candidate_sweep: List[Coord],
-        proposed_positions: Dict[int, Coord],
-        proposed_sweeps: Dict[int, List[Coord]],
+        path: PathState,
+        start_distance: float,
+        end_distance: float,
+        owned_now: Set[str],
+        current_owners: Dict[str, int],
+        planned_owners: Dict[str, int],
+        current_positions: Dict[int, Coord],
+        planned_positions: Dict[int, Coord],
+        intersection_winners: Dict[str, int],
     ) -> bool:
-        min_box_spacing = config.ALVIK_SIZE_IN + config.MIN_ALVIK_CLEARANCE_IN
-        candidate_final = candidate_sweep[-1]
-        for other_id, other_position in proposed_positions.items():
+        resources = self._resources_for_path_range(path, start_distance, end_distance)
+        for resource in resources:
+            owner = current_owners.get(resource)
+            if owner is not None and owner != vehicle_id:
+                return False
+            planned_owner = planned_owners.get(resource)
+            if planned_owner is not None and planned_owner != vehicle_id:
+                return False
+            winner = intersection_winners.get(resource)
+            if winner is not None and winner != vehicle_id and resource not in owned_now:
+                return False
+        return self._position_clear(
+            vehicle_id,
+            path.position_at(start_distance),
+            path.position_at(end_distance),
+            current_positions,
+            planned_positions,
+        )
+
+    def _position_clear(
+        self,
+        vehicle_id: int,
+        start_position: Coord,
+        position: Coord,
+        current_positions: Dict[int, Coord],
+        planned_positions: Dict[int, Coord],
+    ) -> bool:
+        # The resource reservations are the hard collision rule. This fallback
+        # only prevents two centers from collapsing onto the same point in tight
+        # station-access geometry where full body-clearance is not available.
+        min_distance = config.ALVIK_SIZE_IN / 2.0
+        for other_id, other_position in current_positions.items():
             if other_id == vehicle_id:
                 continue
-            if self._positions_conflict(candidate_final, other_position, min_box_spacing):
+            current_distance = euclidean(start_position, other_position)
+            candidate_distance = euclidean(position, other_position)
+            if (
+                candidate_distance < min_distance - 1e-6
+                and candidate_distance <= current_distance + 1e-6
+            ):
                 return False
-            other_sweep = proposed_sweeps.get(other_id, [other_position] * len(candidate_sweep))
-            if self._sweeps_conflict(candidate_sweep, other_sweep, min_box_spacing):
+        for other_id, other_position in planned_positions.items():
+            if other_id == vehicle_id:
+                continue
+            if euclidean(position, other_position) < min_distance - 1e-6:
                 return False
         return True
 
-    def _sample_motion(
+    def _current_resource_owners(self) -> Dict[str, int]:
+        claims: Dict[str, List[VehicleState]] = {}
+        for vehicle in self.vehicles:
+            resources = self._vehicle_current_resources(vehicle)
+            for resource in resources:
+                claims.setdefault(resource, []).append(vehicle)
+
+        owners: Dict[str, int] = {}
+        for resource, vehicles in claims.items():
+            owner = max(vehicles, key=self._movement_priority)
+            owners[resource] = owner.vehicle_id
+        return owners
+
+    def _reserve_resources(
+        self,
+        owners: Dict[str, int],
+        vehicle_id: int,
+        resources: Set[str],
+    ) -> None:
+        for resource in resources:
+            owners.setdefault(resource, vehicle_id)
+
+    def _vehicle_current_resources(self, vehicle: VehicleState) -> Set[str]:
+        resources = self._resources_for_position(vehicle.position)
+        if vehicle.active_path is not None:
+            distance = vehicle.active_path.distance
+            start = max(0.0, distance - 1e-4)
+            end = min(vehicle.active_path.total_length, distance + 1e-4)
+            resources.update(self._resources_for_path_range(vehicle.active_path, start, end))
+        return resources
+
+    def _resources_for_path_range(
         self,
         path: PathState,
         start_distance: float,
         end_distance: float,
-        *,
-        sample_count: int = 7,
-    ) -> List[Coord]:
-        if sample_count <= 1:
-            return [path.position_at(end_distance)]
-        if end_distance <= start_distance:
-            position = path.position_at(start_distance)
-            return [position] * sample_count
-        step = (end_distance - start_distance) / (sample_count - 1)
-        return [
-            path.position_at(start_distance + (step * index))
-            for index in range(sample_count)
-        ]
+    ) -> Set[str]:
+        start_distance = max(0.0, min(path.total_length, start_distance))
+        end_distance = max(start_distance, min(path.total_length, end_distance))
 
-    def _sweeps_conflict(
-        self,
-        first_sweep: List[Coord],
-        second_sweep: List[Coord],
-        min_box_spacing: float,
-    ) -> bool:
-        for index, first in enumerate(first_sweep):
-            if index == 0:
+        resources = set()
+        resources.update(self._resources_for_position(path.position_at(start_distance)))
+        resources.update(self._resources_for_position(path.position_at(end_distance)))
+
+        cumulative = path_cumulative_lengths(path.points)
+        for index, (start, end) in enumerate(zip(path.points, path.points[1:])):
+            segment_start = cumulative[index]
+            segment_end = cumulative[index + 1]
+            if segment_end < start_distance - 1e-9 or segment_start > end_distance + 1e-9:
                 continue
-            start = max(0, index - 1)
-            stop = min(len(second_sweep), index + 2)
-            for other in second_sweep[start:stop]:
-                if self._positions_conflict(first, other, min_box_spacing):
-                    return True
-        return False
+            segment_resource = self._segment_resource(start, end)
+            if segment_resource is not None:
+                resources.add(segment_resource)
+                for endpoint in (start, end):
+                    intersection = self._intersection_resource_for_point(endpoint)
+                    if intersection is not None:
+                        resources.add(intersection)
+            if start_distance - 1e-9 <= segment_start <= end_distance + 1e-9:
+                resources.update(self._resources_for_position(start))
+            if start_distance - 1e-9 <= segment_end <= end_distance + 1e-9:
+                resources.update(self._resources_for_position(end))
+        return resources
 
-    def _positions_conflict(
-        self,
-        first: Coord,
-        second: Coord,
-        min_box_spacing: float,
-    ) -> bool:
-        min_center_distance = (
-            (config.ALVIK_SIZE_IN / 2.0)
-            + (config.MIN_ALVIK_CLEARANCE_IN / 2.0)
+    def _resources_for_position(self, position: Coord) -> Set[str]:
+        resources = set()
+        intersection = self._intersection_resource_for_point(position)
+        if intersection is not None:
+            resources.add(intersection)
+
+        depot_slot = self._depot_slot_resource(position)
+        if depot_slot is not None:
+            resources.add(depot_slot)
+
+        station = self._station_resource(position)
+        if station is not None:
+            resources.add(station)
+        return resources
+
+    def _segment_resource(self, start: Coord, end: Coord) -> str | None:
+        if euclidean(start, end) <= 1e-9:
+            return None
+        start_x, start_y = rounded_point(start)
+        end_x, end_y = rounded_point(end)
+        if math.isclose(start_x, end_x):
+            low_y, high_y = sorted((start_y, end_y))
+            return f"segment:v:{start_x}:{low_y}:{high_y}"
+        if math.isclose(start_y, end_y):
+            low_x, high_x = sorted((start_x, end_x))
+            return f"segment:h:{start_y}:{low_x}:{high_x}"
+        return f"segment:d:{start_x}:{start_y}:{end_x}:{end_y}"
+
+    def _intersection_resource_for_point(self, point: Coord) -> str | None:
+        nearest_x = nearest_index(point[0], self.instance.world.road_xs)
+        nearest_y = nearest_index(point[1], self.instance.world.road_ys)
+        center = (
+            self.instance.world.road_xs[nearest_x],
+            self.instance.world.road_ys[nearest_y],
         )
-        return euclidean(first, second) < min(min_box_spacing, min_center_distance)
+        if euclidean(point, center) > self._intersection_control_radius():
+            return None
+        return f"intersection:{nearest_x}:{nearest_y}"
+
+    def _intersection_control_radius(self) -> float:
+        return config.ALVIK_SIZE_IN + config.MIN_ALVIK_CLEARANCE_IN
+
+    def _depot_slot_resource(self, point: Coord) -> str | None:
+        for index, slot in enumerate(self.depot_return_slots):
+            if euclidean(point, slot) <= 1e-6:
+                return f"depot-slot:{index}"
+        return None
+
+    def _station_resource(self, point: Coord) -> str | None:
+        for station in self.instance.stations:
+            if euclidean(point, station.coord) <= 1e-6:
+                return f"station:{station.station_id}"
+        return None
+
+    def _intersection_winners(
+        self,
+        vehicles: List[VehicleState],
+        max_distance: float,
+        current_owners: Dict[str, int],
+    ) -> Dict[str, int]:
+        requests: Dict[str, List[Tuple[int, int]]] = {}
+        for vehicle in vehicles:
+            path = vehicle.active_path
+            if path is None:
+                continue
+            requested_travel = min(max_distance, path.total_length - path.distance)
+            if requested_travel <= 0:
+                continue
+            start_distance = path.distance
+            end_distance = start_distance + requested_travel
+            owned_now = self._vehicle_current_resources(vehicle)
+            resources = self._resources_for_path_range(path, start_distance, end_distance)
+            for resource in resources:
+                if not resource.startswith("intersection:") or resource in owned_now:
+                    continue
+                owner = current_owners.get(resource)
+                if owner is not None and owner != vehicle.vehicle_id:
+                    continue
+                requests.setdefault(resource, []).append(
+                    (
+                        self._intersection_request_rank(vehicle, path, resource),
+                        vehicle.vehicle_id,
+                    )
+                )
+
+        winners = {}
+        for resource, ranked_requests in requests.items():
+            winners[resource] = min(ranked_requests)[1]
+        return winners
+
+    def _intersection_request_rank(
+        self,
+        vehicle: VehicleState,
+        path: PathState,
+        resource: str,
+    ) -> int:
+        center = self._intersection_center(resource)
+        start_position = path.position_at(path.distance)
+        dx = start_position[0] - center[0]
+        dy = start_position[1] - center[1]
+        if abs(dy) >= abs(dx):
+            approach = "N" if dy >= 0 else "S"
+        else:
+            approach = "E" if dx >= 0 else "W"
+        return INTERSECTION_PRIORITY[approach]
+
+    def _intersection_center(self, resource: str) -> Coord:
+        _, x_index, y_index = resource.split(":")
+        return (
+            self.instance.world.road_xs[int(x_index)],
+            self.instance.world.road_ys[int(y_index)],
+        )
+
+    def _movement_priority(self, vehicle: VehicleState) -> Tuple[int, int, float, int, int]:
+        return (
+            self._depot_departure_phase(vehicle),
+            0 if self._is_homebound(vehicle) else 1,
+            0.0 if vehicle.active_path is None else vehicle.active_path.distance,
+            vehicle.route_index,
+            -vehicle.vehicle_id,
+        )
+
+    def _depot_departure_phase(self, vehicle: VehicleState) -> int:
+        if vehicle.current_node != self.instance.depot_node or vehicle.route_index >= len(vehicle.route):
+            return 0
+        depot_edge_x = self.instance.world.depot_entries["right"][0][0]
+        road_lane_y = self.instance.world.road_ys[0]
+        if vehicle.position[1] < road_lane_y - 1e-6:
+            return 3
+        if vehicle.position[0] < depot_edge_x - 1e-6:
+            return 2
+        return 1
+
+    def _is_in_depot_control_zone(self, position: Coord) -> bool:
+        depot_edge_x = self.instance.world.depot_entries["right"][0][0]
+        road_lane_y = self.instance.world.road_ys[0]
+        return position[0] <= depot_edge_x + 1e-6 and position[1] <= road_lane_y + 1e-6
 
     def _resolve_arrivals(self) -> None:
         for vehicle in self.vehicles:
             if vehicle.active_path is None or vehicle.completed:
                 continue
-            if vehicle.active_path.distance + 1e-9 < vehicle.active_path.total_length:
+            if vehicle.active_path.distance + 1e-5 < vehicle.active_path.total_length:
                 continue
             self._handle_arrival(vehicle)
 
@@ -851,7 +1044,7 @@ class SimulationApp:
             and not returning_home
             and euclidean(current_position, depot_access) > 1e-6
         ):
-            points.extend(self._slot_to_depot_access(current_position, depot_access))
+            points.extend(self._depot_departure_points(current_position, depot_access))
 
         if returning_home and target_node == self.instance.depot_node:
             if depot_entry is None or depot_corridor is None:
@@ -873,6 +1066,23 @@ class SimulationApp:
         if returning_home and home_slot is not None:
             points.extend(self._depot_access_to_slot(depot_access, home_slot))
         return dedupe_points(points)
+
+    def _depot_departure_points(self, slot: Coord, depot_access: Coord) -> List[Coord]:
+        slot_x, slot_y = slot
+        top_y = self.instance.world.depot_entries["top"][0][1]
+        right_x = self.instance.world.depot_entries["right"][0][0]
+        top_row_y = max(y for _, y in self.instance.world.depot_slots)
+        right_col_x = max(x for x, _ in self.instance.world.depot_slots)
+
+        use_right_corridor = (
+            math.isclose(slot_x, right_col_x)
+            or (slot_x > slot_y and not math.isclose(slot_y, top_row_y))
+        )
+        if use_right_corridor:
+            return dedupe_points([slot, (right_x, slot_y), depot_access])
+
+        corner = self._depot_entry_corner()
+        return dedupe_points([slot, (slot_x, top_y), corner, depot_access])
 
     def _depot_parking_points(
         self,
@@ -1366,6 +1576,15 @@ def interpolate_polyline(points: List[Coord], fraction: float) -> Coord:
     return points[-1]
 
 
+def path_cumulative_lengths(points: List[Coord]) -> List[float]:
+    cumulative = [0.0]
+    total = 0.0
+    for start, end in zip(points, points[1:]):
+        total += euclidean(start, end)
+        cumulative.append(total)
+    return cumulative
+
+
 def dedupe_points(points: List[Coord]) -> List[Coord]:
     deduped: List[Coord] = []
     for point in points:
@@ -1399,3 +1618,14 @@ def euclidean(a: Coord, b: Coord) -> float:
 
 def polyline_length(points: List[Coord]) -> float:
     return sum(euclidean(a, b) for a, b in zip(points, points[1:]))
+
+
+def rounded_point(point: Coord) -> Coord:
+    return (
+        round(point[0], RESOURCE_ROUND_DIGITS),
+        round(point[1], RESOURCE_ROUND_DIGITS),
+    )
+
+
+def nearest_index(value: float, candidates: List[float]) -> int:
+    return min(range(len(candidates)), key=lambda index: abs(candidates[index] - value))

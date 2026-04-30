@@ -1436,7 +1436,7 @@ class VRPRPDSolver:
             next_dir = next_dir or prev_dir
             points.append(self._lane_point(coord, prev_dir, next_dir))
 
-        return dedupe_points(points)
+        return simplify_axis_reversals(orthogonalize_points(dedupe_points(points)))
 
     def _lane_point(
         self,
@@ -1518,8 +1518,107 @@ def clamp01(value: float) -> float:
 def dedupe_points(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
     deduped: List[Tuple[float, float]] = []
     for point in points:
-        if not deduped or not (
-            math.isclose(point[0], deduped[-1][0]) and math.isclose(point[1], deduped[-1][1])
-        ):
+        if not deduped or not points_are_equal(point, deduped[-1]):
             deduped.append(point)
     return deduped
+
+
+def orthogonalize_points(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    orthogonal: List[Tuple[float, float]] = []
+    source_points = dedupe_points(points)
+    for index, point in enumerate(source_points):
+        if not orthogonal:
+            orthogonal.append(point)
+            continue
+
+        previous = orthogonal[-1]
+        if math.isclose(previous[0], point[0]) or math.isclose(previous[1], point[1]):
+            orthogonal.append(point)
+            continue
+
+        prior = orthogonal[-2] if len(orthogonal) >= 2 else None
+        following = source_points[index + 1] if index + 1 < len(source_points) else None
+        corner = choose_orthogonal_corner(previous, point, prior=prior, following=following)
+        orthogonal.append(corner)
+        orthogonal.append(point)
+
+    return dedupe_points(orthogonal)
+
+
+def simplify_axis_reversals(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    simplified = dedupe_points(points)
+    changed = True
+    while changed and len(simplified) >= 3:
+        changed = False
+        next_points = [simplified[0]]
+        for middle, end in zip(simplified[1:], simplified[2:]):
+            start = next_points[-1]
+            if axis_reversal(start, middle, end):
+                changed = True
+                continue
+            next_points.append(middle)
+        next_points.append(simplified[-1])
+        simplified = dedupe_points(next_points)
+    return simplified
+
+
+def axis_reversal(
+    start: Tuple[float, float],
+    middle: Tuple[float, float],
+    end: Tuple[float, float],
+) -> bool:
+    if math.isclose(start[0], middle[0]) and math.isclose(middle[0], end[0]):
+        return (middle[1] - start[1]) * (end[1] - middle[1]) < 0
+    if math.isclose(start[1], middle[1]) and math.isclose(middle[1], end[1]):
+        return (middle[0] - start[0]) * (end[0] - middle[0]) < 0
+    return False
+
+
+def choose_orthogonal_corner(
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+    *,
+    prior: Tuple[float, float] | None,
+    following: Tuple[float, float] | None,
+) -> Tuple[float, float]:
+    candidates = [
+        (end[0], start[1]),
+        (start[0], end[1]),
+    ]
+    best_corner = candidates[0]
+    best_score = float("-inf")
+    for corner in candidates:
+        score = 0
+        start_axis = segment_axis(start, corner)
+        end_axis = segment_axis(corner, end)
+        if prior is not None and start_axis is not None:
+            if start_axis == segment_axis(prior, start):
+                score += 2
+        if following is not None and end_axis is not None:
+            if end_axis == segment_axis(end, following):
+                score += 2
+        if following is not None and start_axis is not None:
+            if start_axis == segment_axis(corner, following):
+                score += 1
+        if prior is not None and end_axis is not None:
+            if end_axis == segment_axis(prior, corner):
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_corner = corner
+    return best_corner
+
+
+def segment_axis(
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+) -> str | None:
+    if math.isclose(start[0], end[0]) and not math.isclose(start[1], end[1]):
+        return "vertical"
+    if math.isclose(start[1], end[1]) and not math.isclose(start[0], end[0]):
+        return "horizontal"
+    return None
+
+
+def points_are_equal(first: Tuple[float, float], second: Tuple[float, float]) -> bool:
+    return math.isclose(first[0], second[0]) and math.isclose(first[1], second[1])
