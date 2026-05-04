@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from vrp_rpd_sim import config
+from vrp_rpd_sim.unity_export import export_unity_json
 from vrp_rpd_sim.solution_cache import solve_with_solution_cache
 from vrp_rpd_sim.world import build_instance
 from vrp_rpd_sim.solver import VRPRPDSolver
@@ -58,6 +59,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print depot return debug logs while the simulation is running.",
     )
+    parser.add_argument(
+        "--export-unity-json",
+        default=None,
+        help="Write a Unity playback snapshot JSON file and exit.",
+    )
+    parser.add_argument(
+        "--unity-capture-interval",
+        type=float,
+        default=0.1,
+        help="Snapshot cadence in seconds for Unity export playback data.",
+    )
     return parser
 
 
@@ -87,6 +99,16 @@ def main() -> None:
     print(f"  Final used:       {result.best_label}")
     if cache_path is not None:
         print(f"  Solution cache:   {'hit' if cache_hit else 'miss'} ({cache_path})")
+
+    if args.export_unity_json:
+        export_path = export_unity_json(
+            args.export_unity_json,
+            runtime_config,
+            capture_interval_sec=args.unity_capture_interval,
+            debug_depot=args.debug_depot,
+        )
+        print(f"  Unity export:     {export_path}")
+        return
 
     if args.headless:
         return

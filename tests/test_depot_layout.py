@@ -7,9 +7,9 @@ import pygame
 
 from vrp_rpd_sim import config
 from vrp_rpd_sim.model import Operation
-from vrp_rpd_sim.render import SimulationApp
 from vrp_rpd_sim.solver import VRPRPDSolver
 from vrp_rpd_sim.world import build_instance, build_world
+from simulation_fixtures import build_fixture_app
 
 
 class DepotLayoutTests(unittest.TestCase):
@@ -91,10 +91,9 @@ class DepotLayoutTests(unittest.TestCase):
         self.assertEqual(36, len(instance.active_job_ids))
 
     def test_homebound_paths_end_at_assigned_slots(self) -> None:
-        instance = build_instance(job_count=self.TEST_JOB_COUNT)
-        solver = VRPRPDSolver(instance)
-        result = solver.solve()
-        app = SimulationApp(instance, solver, result)
+        app = build_fixture_app()
+        instance = app.instance
+        solver = app.solver
 
         active_vehicles = [vehicle for vehicle in app.vehicles if vehicle.route]
         for vehicle in active_vehicles:
@@ -104,14 +103,16 @@ class DepotLayoutTests(unittest.TestCase):
             vehicle.route_index = len(vehicle.route)
             vehicle.active_path = None
 
+        app._assign_return_targets()
+        assigned_vehicles = [
+            vehicle
+            for vehicle in active_vehicles
+            if vehicle.return_slot_index is not None and not vehicle.completed
+        ]
+        self.assertGreaterEqual(len(assigned_vehicles), 2)
+
         assigned_slots = []
-        for _ in range(3):
-            app._assign_return_targets()
-            vehicle = next(
-                vehicle
-                for vehicle in active_vehicles
-                if vehicle.return_slot_index is not None and not vehicle.completed
-            )
+        for vehicle in assigned_vehicles:
             path = app._travel_points(
                 vehicle.position,
                 vehicle.current_node,
@@ -124,15 +125,11 @@ class DepotLayoutTests(unittest.TestCase):
             self.assertEqual(vehicle.home_slot, path[-1])
             self.assertIn(vehicle.depot_entry, path)
             assigned_slots.append(vehicle.home_slot)
-            vehicle.completed = True
 
-        self.assertEqual(app.depot_return_slots[:3], assigned_slots)
+        self.assertEqual(len(set(assigned_slots)), len(assigned_slots))
 
     def test_corridor_stack_invariant_no_crossover(self) -> None:
-        instance = build_instance(job_count=self.TEST_JOB_COUNT)
-        solver = VRPRPDSolver(instance)
-        result = solver.solve()
-        app = SimulationApp(instance, solver, result)
+        app = build_fixture_app()
 
         top_corridor_slots = app.depot_corridor_slots["top_1"]
         self.assertEqual(
@@ -152,6 +149,27 @@ class DepotLayoutTests(unittest.TestCase):
             app._refresh_corridor_frontier()
 
         self.assertEqual(top_corridor_slots, observed)
+
+    def test_homebound_assignments_do_not_skip_back_left_slots(self) -> None:
+        app = build_fixture_app()
+        for vehicle in app.vehicles:
+            if not vehicle.route:
+                continue
+            last_stop = app.solver.customer_node(vehicle.route[-1].customer_id)
+            vehicle.current_node = last_stop
+            vehicle.position = app.instance.world.coords[last_stop]
+            vehicle.route_index = len(vehicle.route)
+            vehicle.active_path = None
+
+        app._assign_return_targets()
+
+        assigned_indexes = sorted(
+            vehicle.return_slot_index
+            for vehicle in app.vehicles
+            if vehicle.return_slot_index is not None
+        )
+        self.assertGreaterEqual(len(assigned_indexes), 2)
+        self.assertEqual(list(range(len(assigned_indexes))), assigned_indexes)
 
 
 if __name__ == "__main__":

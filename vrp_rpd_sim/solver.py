@@ -1445,7 +1445,7 @@ class VRPRPDSolver:
         next_dir: str | None,
     ) -> Tuple[float, float]:
         x, y = coord
-        lane = self.instance.world.lane_center_offset_in
+        lane = self.instance.world.lane_center_offset_in * config.LANE_DIRECTION_SIGN
         vertical_dir = None
         horizontal_dir = None
         for direction in (prev_dir, next_dir):
@@ -1455,14 +1455,14 @@ class VRPRPDSolver:
                 horizontal_dir = direction
 
         if vertical_dir and horizontal_dir:
-            x_offset = -lane if vertical_dir == "N" else lane
-            y_offset = lane if horizontal_dir == "E" else -lane
+            x_offset = lane if vertical_dir == "N" else -lane
+            y_offset = -lane if horizontal_dir == "E" else lane
             return (x + x_offset, y + y_offset)
         if vertical_dir:
-            x_offset = -lane if vertical_dir == "N" else lane
+            x_offset = lane if vertical_dir == "N" else -lane
             return (x + x_offset, y)
         if horizontal_dir:
-            y_offset = lane if horizontal_dir == "E" else -lane
+            y_offset = -lane if horizontal_dir == "E" else lane
             return (x, y + y_offset)
         return coord
 

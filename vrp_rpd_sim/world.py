@@ -292,9 +292,14 @@ def _build_depot_slots(anchor: Coord) -> List[Coord]:
 
 
 def _depot_access_coord(road_xs: List[float], road_ys: List[float]) -> Coord:
+    # Anchor at the SW corner of the SW intersection so outgoing traffic in either
+    # direction (N on the leftmost road's east-of-centerline lane after flip is the
+    # +X side; E on the bottom road's south-of-centerline lane is the -Y side) can
+    # depart without re-entering the depot control zone. Incoming W-bound traffic
+    # turns south at (road_xs[0] - LANE, road_ys[0] + LANE) before reaching here.
     return (
         road_xs[0] - config.LANE_CENTER_OFFSET_IN,
-        road_ys[0] + config.LANE_CENTER_OFFSET_IN,
+        road_ys[0] - config.LANE_CENTER_OFFSET_IN,
     )
 
 

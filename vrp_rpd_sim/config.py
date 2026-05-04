@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 # World geometry -------------------------------------------------------------
 
-WORLD_SIZE_IN = 96.0  # 8 ft x 8 ft
+WORLD_SIZE_IN = 120.0  # 10 ft x 10 ft
 
 VERTICAL_ROAD_COUNT = 7
 HORIZONTAL_ROAD_COUNT = 7
@@ -81,6 +81,11 @@ LANE_CENTER_OFFSET_IN = (ROAD_MEDIAN_GAP_IN / 2.0) + (ROAD_STRIP_WIDTH_IN / 2.0)
 DEPOT_ENTRY_LANE_OFFSET_IN = LANE_CENTER_OFFSET_IN
 DEPOT_ENTRY_TOP_COUNT = 3
 DEPOT_ENTRY_RIGHT_COUNT = 3
+
+# Right-hand traffic: northbound on east half (+X), eastbound on south half (-Y).
+# Flip to False for left-hand traffic.
+DRIVE_SIDE_RIGHT = True
+LANE_DIRECTION_SIGN = 1 if DRIVE_SIDE_RIGHT else -1
 
 # Solver --------------------------------------------------------------------
 
