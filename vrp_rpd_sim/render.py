@@ -175,6 +175,17 @@ class SimulationApp:
         self.corridor_next_slot: Dict[str, Coord | None] = {}
         self._build_depot_return_topology()
 
+        # Stuck detection while returning to depot. Tracks per-vehicle: time the
+        # vehicle entered the homebound state, last sim_time it made forward
+        # progress, and whether a stuck warning has already been printed (so we
+        # warn once per stall, not every frame).
+        self.homebound_since: Dict[int, float] = {}
+        self.last_progress_time: Dict[int, float] = {}
+        self.last_progress_distance: Dict[int, float] = {}
+        self.stuck_warned: Dict[int, bool] = {}
+        self.no_slot_warned: bool = False
+        self.stuck_warn_threshold_sec: float = 4.0
+
         self.screen: pygame.Surface | None = None
         self.clock: pygame.time.Clock | None = None
         if not self.headless:
@@ -291,6 +302,11 @@ class SimulationApp:
         self.pause_counts.clear()
         self.blocked_substeps = 0
         self.reserved_return_slots.clear()
+        self.homebound_since.clear()
+        self.last_progress_time.clear()
+        self.last_progress_distance.clear()
+        self.stuck_warned.clear()
+        self.no_slot_warned = False
         self._build_depot_return_topology()
         self.station_progress = self._build_station_progress()
         self.vehicles = self._build_vehicle_states()
@@ -430,6 +446,11 @@ class SimulationApp:
         if self.debug_depot:
             print(f"[depot {self.sim_time:6.2f}s] {message}")
 
+    def _warn_depot_message(self, message: str) -> None:
+        # Stuck/anomaly diagnostics: print regardless of --debug-depot so the
+        # user can see why a vehicle isn't completing its return.
+        print(f"[depot WARN {self.sim_time:6.2f}s] {message}")
+
     def _is_homebound(self, vehicle: VehicleState) -> bool:
         return vehicle.route_index >= len(vehicle.route) and not vehicle.completed
 
@@ -454,6 +475,7 @@ class SimulationApp:
         while True:
             assignment = self._next_return_assignment(active_corridors)
             if assignment is None:
+                self._log_unassigned_homebound(active_corridors)
                 return
             vehicle, slot, corridor_id = assignment
             vehicle.home_slot = slot
@@ -468,6 +490,30 @@ class SimulationApp:
             )
             self._refresh_corridor_frontier()
             continue
+
+    def _log_unassigned_homebound(self, active_corridors: Set[str | None]) -> None:
+        unassigned = [
+            vehicle
+            for vehicle in self.vehicles
+            if self._is_homebound(vehicle) and vehicle.return_slot_index is None
+        ]
+        if not unassigned:
+            self.no_slot_warned = False
+            return
+        if self.no_slot_warned:
+            return
+        free_slots = [
+            slot for slot in self.depot_return_slots
+            if slot not in self.reserved_return_slots
+        ]
+        ids = ", ".join(f"V{v.vehicle_id + 1}" for v in unassigned)
+        self._warn_depot_message(
+            f"no return assignment available for {ids}: "
+            f"{len(free_slots)}/{len(self.depot_return_slots)} slots free, "
+            f"reserved={len(self.reserved_return_slots)}, active_corridors={sorted(c for c in active_corridors if c)}, "
+            f"corridor_next_slot={ {cid: (None if s is None else tuple(round(v, 2) for v in s)) for cid, s in self.corridor_next_slot.items()} }"
+        )
+        self.no_slot_warned = True
 
     def _next_return_assignment(
         self,
@@ -491,9 +537,11 @@ class SimulationApp:
                 and self.corridor_next_slot.get(corridor_id) == slot
             ]
             if not candidate_corridors:
-                # Transient unavailability (corridor active or filling out of order):
-                # wait, preserving the left-first slot iteration.
-                return None
+                # No reachable corridor for this slot right now (every corridor
+                # that lands here is already in use, or this isn't its frontier).
+                # Skip and try a deeper slot — bailing out here would deadlock
+                # any vehicle whose only reachable slot is past this one.
+                continue
             clear_corridors = [
                 corridor_id
                 for corridor_id in candidate_corridors
@@ -532,7 +580,37 @@ class SimulationApp:
         for blocking_slot in slots_in_corridor[target_index + 1:]:
             if blocking_slot in self.reserved_return_slots:
                 return False
+
+        # Cross-corridor path crossing: top corridors run down a column and
+        # right corridors run along a row, so they share the corner cell where
+        # column x equals row y. Reject this candidate if the slot or any cell
+        # on the way to it is already on another active vehicle's swept path.
+        candidate_cells = set(slots_in_corridor[target_index:])
+        for other in self.vehicles:
+            if other.completed:
+                continue
+            other_corridor = other.depot_corridor
+            if other_corridor is None or other_corridor == corridor_id:
+                continue
+            if other.return_slot_index is None:
+                continue
+            other_cells = self._corridor_swept_cells(other_corridor, other.home_slot)
+            if candidate_cells & other_cells:
+                return False
         return True
+
+    def _corridor_swept_cells(self, corridor_id: str, target_slot: Coord) -> Set[Coord]:
+        """Depot-grid cells that a vehicle parking via (corridor, target_slot) occupies.
+
+        Includes the target plus every shallower slot in the corridor (those
+        the vehicle must drive past to reach `target_slot`).
+        """
+        slots_in_corridor = self.depot_corridor_slots.get(corridor_id, [])
+        try:
+            target_index = slots_in_corridor.index(target_slot)
+        except ValueError:
+            return {target_slot}
+        return set(slots_in_corridor[target_index:])
 
     def _next_return_slot(self) -> Coord | None:
         for slot in self.depot_return_slots:
@@ -601,7 +679,58 @@ class SimulationApp:
             self._prime_vehicle_targets()
             self._advance_vehicles(step)
             self._resolve_arrivals()
+            self._check_homebound_stuck()
             remaining -= step
+
+    def _check_homebound_stuck(self) -> None:
+        # Watchdog: if a homebound vehicle has not advanced its path distance
+        # for more than `stuck_warn_threshold_sec`, print one diagnostic line
+        # explaining the vehicle's state. Resets on completion or progress.
+        for vehicle in self.vehicles:
+            vid = vehicle.vehicle_id
+            if vehicle.completed:
+                self.homebound_since.pop(vid, None)
+                self.last_progress_time.pop(vid, None)
+                self.last_progress_distance.pop(vid, None)
+                self.stuck_warned.pop(vid, None)
+                continue
+            if not self._is_homebound(vehicle):
+                self.last_progress_time.pop(vid, None)
+                self.last_progress_distance.pop(vid, None)
+                self.stuck_warned.pop(vid, None)
+                continue
+
+            distance = vehicle.active_path.distance if vehicle.active_path is not None else -1.0
+            previous = self.last_progress_distance.get(vid)
+            if previous is None or distance > previous + 1e-6:
+                self.last_progress_distance[vid] = distance
+                self.last_progress_time[vid] = self.sim_time
+                self.stuck_warned[vid] = False
+                continue
+
+            stalled_for = self.sim_time - self.last_progress_time.get(vid, self.sim_time)
+            if stalled_for >= self.stuck_warn_threshold_sec and not self.stuck_warned.get(vid, False):
+                path = vehicle.active_path
+                if path is not None:
+                    path_info = (
+                        f"path_dist={path.distance:.2f}/{path.total_length:.2f}, "
+                        f"remaining={path.total_length - path.distance:.2f}"
+                    )
+                else:
+                    path_info = "no active_path"
+                self._warn_depot_message(
+                    f"V{vid + 1} STUCK while homebound for {stalled_for:.1f}s "
+                    f"(blocked_count={self.blocked_counts.get(vid, 0)}, "
+                    f"pause_count={self.pause_counts.get(vid, 0)}): "
+                    f"pos={tuple(round(v, 2) for v in vehicle.position)}, "
+                    f"current_node={vehicle.current_node}, "
+                    f"home_slot={tuple(round(v, 2) for v in vehicle.home_slot)}, "
+                    f"corridor={vehicle.depot_corridor}, "
+                    f"slot_idx={vehicle.return_slot_index}, "
+                    f"target_node={vehicle.target_node}, "
+                    f"{path_info}"
+                )
+                self.stuck_warned[vid] = True
 
     def _prime_vehicle_targets(self) -> None:
         self._assign_return_targets()
@@ -645,6 +774,14 @@ class SimulationApp:
                     self._handle_arrival(vehicle)
                 continue
 
+            # Track the moment a vehicle becomes homebound (route exhausted).
+            if vehicle.vehicle_id not in self.homebound_since:
+                self.homebound_since[vehicle.vehicle_id] = self.sim_time
+                self._debug_depot_message(
+                    f"V{vehicle.vehicle_id + 1} entered homebound at "
+                    f"{vehicle.current_node} pos={tuple(round(v, 2) for v in vehicle.position)}"
+                )
+
             if vehicle.return_slot_index is None:
                 self._assign_return_targets()
             if vehicle.return_slot_index is None:
@@ -667,13 +804,36 @@ class SimulationApp:
                 else:
                     points = self._depot_parking_points(vehicle.position, vehicle.home_slot)
                 vehicle.active_path = build_path_state(points)
+                self._debug_depot_message(
+                    f"V{vehicle.vehicle_id + 1} return path built: "
+                    f"{len(points)} pts, length={polyline_length(points):.2f}, "
+                    f"corridor={vehicle.depot_corridor}, slot={tuple(round(v, 2) for v in vehicle.home_slot)}, "
+                    f"start={tuple(round(v, 2) for v in vehicle.position)}, "
+                    f"end={tuple(round(v, 2) for v in points[-1]) if points else None}"
+                )
                 if vehicle.active_path is None:
                     if euclidean(vehicle.position, vehicle.home_slot) <= 1e-6:
                         vehicle.completed = True
                         vehicle.completion_time = self.sim_time
+                        self._debug_depot_message(
+                            f"V{vehicle.vehicle_id + 1} completed (degenerate path) at home_slot"
+                        )
+                    else:
+                        # Path is empty/degenerate but vehicle isn't at its home_slot:
+                        # this is the bug surface where a vehicle gets stuck silently.
+                        self._warn_depot_message(
+                            f"V{vehicle.vehicle_id + 1} got empty return path while "
+                            f"pos={tuple(round(v, 2) for v in vehicle.position)} != "
+                            f"home_slot={tuple(round(v, 2) for v in vehicle.home_slot)} "
+                            f"(current_node={vehicle.current_node}, corridor={vehicle.depot_corridor})"
+                        )
             else:
                 vehicle.completed = True
                 vehicle.completion_time = self.sim_time
+                self._debug_depot_message(
+                    f"V{vehicle.vehicle_id + 1} completed return at slot "
+                    f"{tuple(round(v, 2) for v in vehicle.home_slot)}"
+                )
 
     def _advance_vehicles(self, step: float) -> None:
         max_distance = self.instance.instance_config.alvik_speed_in_per_sec * step

@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(python -m pytest tests/ -x --tb=short)",
-      "Bash(python -m pytest tests/ --tb=short)"
+      "Bash(python -m pytest tests/ --tb=short)",
+      "Bash(python -m py_compile vrp_rpd_sim/render.py)",
+      "Bash(python -m pytest -x --tb=short)"
     ]
   }
 }
