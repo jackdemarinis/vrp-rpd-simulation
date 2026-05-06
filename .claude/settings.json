@@ -4,7 +4,13 @@
       "Bash(python -m pytest tests/ -x --tb=short)",
       "Bash(python -m pytest tests/ --tb=short)",
       "Bash(python -m py_compile vrp_rpd_sim/render.py)",
-      "Bash(python -m pytest -x --tb=short)"
+      "Bash(python -m pytest -x --tb=short)",
+      "Bash(python main.py --export-unity-json playback.json --unity-capture-interval 0.1)",
+      "Bash(python main.py --export-unity-json playback.json --unity-capture-interval 0.1 --debug-depot)",
+      "Bash(python diagnose_export.py)",
+      "Bash(python -m py_compile vrp_rpd_sim/render.py vrp_rpd_sim/unity_export.py main.py)",
+      "Bash(rm -f diagnose_export.py)",
+      "Bash(rm -f playback.json)"
     ]
   }
 }

@@ -296,9 +296,11 @@ def apply_cli_overrides(
     fixed_processing_time: float | None = None,
     sim_speed: float | None = None,
     fullscreen: bool | None = None,
+    seed: int | None = None,
 ) -> RuntimeConfig:
     instance_config = runtime_config.instance
     app_config = runtime_config.app
+    solver_config = runtime_config.solver
 
     if job_count is not None:
         instance_config = replace(instance_config, active_job_count=job_count)
@@ -310,8 +312,15 @@ def apply_cli_overrides(
         app_config = replace(app_config, sim_speed_multiplier=sim_speed)
     if fullscreen is not None:
         app_config = replace(app_config, start_fullscreen=fullscreen)
+    if seed is not None:
+        solver_config = replace(solver_config, random_seed=seed)
 
-    return replace(runtime_config, instance=instance_config, app=app_config)
+    return replace(
+        runtime_config,
+        instance=instance_config,
+        app=app_config,
+        solver=solver_config,
+    )
 
 
 def _load_dataclass[T](

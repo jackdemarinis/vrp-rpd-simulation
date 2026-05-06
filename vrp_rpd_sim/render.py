@@ -88,6 +88,11 @@ class VehicleState:
     depot_entry: Coord | None = None
     depot_corridor: str | None = None
     departure_release_time: float = 0.0
+    # When > 0, the vehicle reverses along its path at normal speed for this
+    # many substeps. Set by the deadlock breaker so the retreat is smooth
+    # instead of an instant teleport, and so multiple vehicles don't all
+    # decide to retreat in the same substep.
+    yield_reverse_substeps_remaining: int = 0
 
     def load_marker(self) -> int:
         return self.load
@@ -118,6 +123,9 @@ class SimulationApp:
         debug_depot: bool = False,
         cache_config: config.CacheConfig | None = None,
         headless: bool = False,
+        record_unity_path: str | None = None,
+        record_capture_interval_sec: float = 0.1,
+        auto_quit_on_complete: bool = False,
     ) -> None:
         self.headless = headless
         if not self.headless:
@@ -182,9 +190,14 @@ class SimulationApp:
         self.homebound_since: Dict[int, float] = {}
         self.last_progress_time: Dict[int, float] = {}
         self.last_progress_distance: Dict[int, float] = {}
+        self.last_progress_signal: Dict[int, Tuple] = {}
         self.stuck_warned: Dict[int, bool] = {}
         self.no_slot_warned: bool = False
         self.stuck_warn_threshold_sec: float = 4.0
+        # Forward-progress watermarks: max path.distance reached + the time
+        # it was reached, used by the deadlock recovery trigger.
+        self._max_path_distance: Dict[int, float] = {}
+        self._max_path_time: Dict[int, float] = {}
 
         self.screen: pygame.Surface | None = None
         self.clock: pygame.time.Clock | None = None
@@ -198,14 +211,35 @@ class SimulationApp:
         self.vehicles = self._build_vehicle_states()
         self._refresh_corridor_frontier()
 
+        # Recording: capture playback frames from a live pygame run, then write
+        # the same JSON shape the headless exporter produces.
+        self._record_unity_path = record_unity_path
+        self._record_capture_interval = record_capture_interval_sec
+        self._record_frames: list = []
+        self._record_next_capture_time: float = record_capture_interval_sec
+        self._auto_quit_on_complete = auto_quit_on_complete
+
     def run(self) -> None:
         if self.headless:
             raise RuntimeError("SimulationApp.run() is unavailable in headless mode.")
+        if self._record_unity_path is not None:
+            from .unity_export import capture_frame
+            self._record_frames.append(capture_frame(self))
+
+        # Fixed-timestep accumulator: the simulator advances in deterministic
+        # 0.02 s chunks regardless of frame rate, so a given seed yields the
+        # exact same outcome every run. Real-time playback speed is preserved
+        # because we still scale wall-clock dt by sim_speed_multiplier.
+        SIM_STEP = 0.02
+        ACCUMULATOR_CAP = 0.5  # avoid spiral-of-death after a long pause/stall
+        sim_accumulator = 0.0
+
         running = True
+        recorded_complete = False
         while running:
             if self.clock is None:
                 raise RuntimeError("Simulation clock was not initialized.")
-            dt = min(self.clock.tick_busy_loop(config.FPS) / 1000.0, 0.05)
+            real_dt = self.clock.tick_busy_loop(config.FPS) / 1000.0
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -223,10 +257,49 @@ class SimulationApp:
                     self._update_speed_from_mouse(event.pos)
 
             if not self.paused:
-                self._step_simulation(dt * self.sim_speed_multiplier)
+                sim_accumulator = min(
+                    sim_accumulator + real_dt * self.sim_speed_multiplier,
+                    ACCUMULATOR_CAP,
+                )
+                while sim_accumulator >= SIM_STEP:
+                    self._step_simulation(SIM_STEP)
+                    sim_accumulator -= SIM_STEP
+                if self._record_unity_path is not None:
+                    from .unity_export import capture_frame
+                    while self.sim_time + 1e-9 >= self._record_next_capture_time:
+                        self._record_frames.append(capture_frame(self))
+                        self._record_next_capture_time += self._record_capture_interval
+                    if (
+                        self._auto_quit_on_complete
+                        and all(v.completed for v in self.vehicles)
+                    ):
+                        recorded_complete = True
+                        running = False
             self._draw()
 
         pygame.quit()
+
+        if self._record_unity_path is not None:
+            from .unity_export import capture_frame, build_payload_from_recording, write_payload
+            # Final frame so the very last state is in the file.
+            if not self._record_frames or self._record_frames[-1]["timeSec"] != self.sim_time:
+                self._record_frames.append(capture_frame(self))
+            simulation_completed = recorded_complete or all(v.completed for v in self.vehicles)
+            payload = build_payload_from_recording(
+                self,
+                self._record_frames,
+                capture_interval_sec=self._record_capture_interval,
+                simulation_completed=simulation_completed,
+                termination_reason=(
+                    "" if simulation_completed
+                    else "Recording stopped before all vehicles completed (window closed)."
+                ),
+            )
+            path = write_payload(self._record_unity_path, payload)
+            print(
+                f"[recording] wrote {len(self._record_frames)} frames to {path} "
+                f"(simulationCompleted={simulation_completed}, sim_time={self.sim_time:.2f}s)"
+            )
 
     def _handle_keydown(self, event: pygame.event.Event) -> None:
         if event.key == pygame.K_SPACE:
@@ -305,8 +378,11 @@ class SimulationApp:
         self.homebound_since.clear()
         self.last_progress_time.clear()
         self.last_progress_distance.clear()
+        self.last_progress_signal.clear()
         self.stuck_warned.clear()
         self.no_slot_warned = False
+        self._max_path_distance.clear()
+        self._max_path_time.clear()
         self._build_depot_return_topology()
         self.station_progress = self._build_station_progress()
         self.vehicles = self._build_vehicle_states()
@@ -679,58 +755,142 @@ class SimulationApp:
             self._prime_vehicle_targets()
             self._advance_vehicles(step)
             self._resolve_arrivals()
-            self._check_homebound_stuck()
+            self._check_vehicle_stuck()
             remaining -= step
 
-    def _check_homebound_stuck(self) -> None:
-        # Watchdog: if a homebound vehicle has not advanced its path distance
-        # for more than `stuck_warn_threshold_sec`, print one diagnostic line
-        # explaining the vehicle's state. Resets on completion or progress.
+    def _check_vehicle_stuck(self) -> None:
+        """Watchdog covering ALL vehicle states (mid-route, depot startup, return).
+
+        Fires once per stall when a vehicle's progress signal hasn't changed
+        for `stuck_warn_threshold_sec`. Dumps full diagnostic context: path
+        progress, what op is next, who's nearby, who shares planned resources.
+        Resets on progress, completion, or fresh path.
+        """
         for vehicle in self.vehicles:
             vid = vehicle.vehicle_id
             if vehicle.completed:
-                self.homebound_since.pop(vid, None)
-                self.last_progress_time.pop(vid, None)
-                self.last_progress_distance.pop(vid, None)
-                self.stuck_warned.pop(vid, None)
-                continue
-            if not self._is_homebound(vehicle):
-                self.last_progress_time.pop(vid, None)
-                self.last_progress_distance.pop(vid, None)
-                self.stuck_warned.pop(vid, None)
+                self._clear_stuck_state(vid)
                 continue
 
-            distance = vehicle.active_path.distance if vehicle.active_path is not None else -1.0
-            previous = self.last_progress_distance.get(vid)
-            if previous is None or distance > previous + 1e-6:
-                self.last_progress_distance[vid] = distance
+            # Vehicle is legitimately waiting on a station's processing time —
+            # not a deadlock, just timed wait. Skip.
+            if vehicle.waiting_customer_id is not None:
+                station_state = self.station_progress.get(vehicle.waiting_customer_id, {})
+                ready_at = station_state.get("ready_at")
+                if ready_at is None or self.sim_time < ready_at:
+                    self._clear_stuck_state(vid)
+                    continue
+
+            # Pre-departure stagger: also a legitimate wait.
+            if (
+                vehicle.route_index == 0
+                and vehicle.current_node == self.instance.depot_node
+                and self.sim_time < vehicle.departure_release_time
+            ):
+                self._clear_stuck_state(vid)
+                continue
+
+            signal = self._vehicle_progress_signal(vehicle)
+            previous = self.last_progress_signal.get(vid) if hasattr(self, "last_progress_signal") else None
+            if previous is None or signal != previous:
+                self.last_progress_signal[vid] = signal
                 self.last_progress_time[vid] = self.sim_time
                 self.stuck_warned[vid] = False
                 continue
 
             stalled_for = self.sim_time - self.last_progress_time.get(vid, self.sim_time)
             if stalled_for >= self.stuck_warn_threshold_sec and not self.stuck_warned.get(vid, False):
-                path = vehicle.active_path
-                if path is not None:
-                    path_info = (
-                        f"path_dist={path.distance:.2f}/{path.total_length:.2f}, "
-                        f"remaining={path.total_length - path.distance:.2f}"
-                    )
-                else:
-                    path_info = "no active_path"
-                self._warn_depot_message(
-                    f"V{vid + 1} STUCK while homebound for {stalled_for:.1f}s "
-                    f"(blocked_count={self.blocked_counts.get(vid, 0)}, "
-                    f"pause_count={self.pause_counts.get(vid, 0)}): "
-                    f"pos={tuple(round(v, 2) for v in vehicle.position)}, "
-                    f"current_node={vehicle.current_node}, "
-                    f"home_slot={tuple(round(v, 2) for v in vehicle.home_slot)}, "
-                    f"corridor={vehicle.depot_corridor}, "
-                    f"slot_idx={vehicle.return_slot_index}, "
-                    f"target_node={vehicle.target_node}, "
-                    f"{path_info}"
-                )
+                self._dump_vehicle_stuck(vehicle, stalled_for)
                 self.stuck_warned[vid] = True
+
+    def _clear_stuck_state(self, vehicle_id: int) -> None:
+        if hasattr(self, "last_progress_signal"):
+            self.last_progress_signal.pop(vehicle_id, None)
+        self.last_progress_time.pop(vehicle_id, None)
+        self.last_progress_distance.pop(vehicle_id, None)
+        self.stuck_warned.pop(vehicle_id, None)
+        self.homebound_since.pop(vehicle_id, None)
+
+    def _vehicle_progress_signal(self, vehicle: VehicleState) -> Tuple:
+        # Tuple of state that, if unchanged across the threshold window, means
+        # the vehicle has made no meaningful progress. Includes route_index so
+        # arrivals/op-completions count as progress.
+        path_distance = (
+            round(vehicle.active_path.distance, 4)
+            if vehicle.active_path is not None
+            else None
+        )
+        return (
+            vehicle.route_index,
+            round(vehicle.position[0], 3),
+            round(vehicle.position[1], 3),
+            path_distance,
+            vehicle.waiting_customer_id,
+            vehicle.target_node,
+            vehicle.depot_corridor,
+            vehicle.return_slot_index,
+        )
+
+    def _dump_vehicle_stuck(self, vehicle: VehicleState, stalled_for: float) -> None:
+        vid = vehicle.vehicle_id
+        op_str = "RETURN" if vehicle.route_index >= len(vehicle.route) else (
+            f"{vehicle.route[vehicle.route_index].kind}"
+            f"{vehicle.route[vehicle.route_index].customer_id}"
+        )
+        path = vehicle.active_path
+        if path is not None:
+            path_info = (
+                f"path={path.distance:.2f}/{path.total_length:.2f} "
+                f"(remaining {path.total_length - path.distance:.2f})"
+            )
+        else:
+            path_info = "no active_path"
+
+        # Identify near neighbors and what they're doing.
+        my_pos = vehicle.position
+        nearby = []
+        for other in self.vehicles:
+            if other.vehicle_id == vid or other.completed:
+                continue
+            dist = euclidean(my_pos, other.position)
+            if dist <= 12.0:  # ~3.4x alvik footprint
+                nearby.append((dist, other))
+        nearby.sort(key=lambda pair: pair[0])
+
+        depot_extras = ""
+        if self._is_homebound(vehicle):
+            depot_extras = (
+                f", home_slot={tuple(round(v, 2) for v in vehicle.home_slot)}"
+                f", corridor={vehicle.depot_corridor}"
+                f", slot_idx={vehicle.return_slot_index}"
+            )
+
+        self._warn_depot_message(
+            f"V{vid + 1} STUCK {stalled_for:.1f}s "
+            f"(blocked={self.blocked_counts.get(vid, 0)}, pause={self.pause_counts.get(vid, 0)}): "
+            f"pos={tuple(round(v, 2) for v in my_pos)}, "
+            f"node={vehicle.current_node}, target={vehicle.target_node}, "
+            f"route_idx={vehicle.route_index}/{len(vehicle.route)}, next_op={op_str}, "
+            f"waiting_cust={vehicle.waiting_customer_id}, "
+            f"{path_info}"
+            f"{depot_extras}"
+        )
+        for dist, other in nearby[:4]:
+            other_op = "RETURN" if other.route_index >= len(other.route) else (
+                f"{other.route[other.route_index].kind}"
+                f"{other.route[other.route_index].customer_id}"
+            )
+            other_remaining = (
+                f"{other.active_path.total_length - other.active_path.distance:.2f}"
+                if other.active_path is not None
+                else "no_path"
+            )
+            self._warn_depot_message(
+                f"  near V{other.vehicle_id + 1} @ "
+                f"{tuple(round(v, 2) for v in other.position)} "
+                f"(dist {dist:.2f}, next_op={other_op}, "
+                f"target={other.target_node}, path_remaining={other_remaining})"
+            )
 
     def _prime_vehicle_targets(self) -> None:
         self._assign_return_targets()
@@ -849,8 +1009,33 @@ class SimulationApp:
         ]
         intersection_winners = self._intersection_winners(movable, max_distance, current_owners)
 
+        # Vehicles in scheduled-reverse mode move *backward* one substep's
+        # worth, then the counter is decremented. Done before the forward
+        # candidate logic so reversers don't compete for forward resources.
+        for vehicle in movable:
+            if vehicle.yield_reverse_substeps_remaining <= 0:
+                continue
+            path = vehicle.active_path
+            if path is None or path.distance <= 1e-6:
+                vehicle.yield_reverse_substeps_remaining = 0
+                continue
+            new_distance = max(0.0, path.distance - max_distance)
+            path.distance = new_distance
+            vehicle.position = path.position()
+            vehicle.yield_reverse_substeps_remaining -= 1
+            self.blocked_counts[vehicle.vehicle_id] = 0
+        # Refresh ownership/position state since reversers just moved.
+        current_owners = self._current_resource_owners()
+        current_positions = {
+            vehicle.vehicle_id: vehicle.position
+            for vehicle in self.vehicles
+        }
+
         candidates: Dict[int, MovementCandidate] = {}
         for vehicle in movable:
+            if vehicle.yield_reverse_substeps_remaining > 0:
+                # Reversers don't try to advance forward this substep.
+                continue
             path = vehicle.active_path
             if path is None:
                 continue
@@ -870,6 +1055,17 @@ class SimulationApp:
                 current_owners,
                 intersection_winners,
             )
+            # Predictive yield: simulate where this vehicle and every
+            # higher-priority vehicle will be over the next ~1.5 sim-seconds.
+            # If a future-clearance violation is predicted, shrink `allowed`
+            # so this vehicle yields well before the conflict zone instead of
+            # advancing into a deadlock that needs force-reverse to escape.
+            if allowed > 1e-6:
+                allowed = self._lookahead_yield_travel(
+                    vehicle,
+                    allowed,
+                    max_distance,
+                )
             if allowed <= 1e-6:
                 self._record_pause(vehicle.vehicle_id)
                 continue
@@ -959,8 +1155,132 @@ class SimulationApp:
                 self.status_message = "Traffic blocked: no clearance-safe move available"
         else:
             self.blocked_substeps = 0
+
+        # Per-vehicle deadlock recovery: track the maximum path.distance each
+        # vehicle has ever reached. If a vehicle's path hasn't grown past its
+        # high-water mark for `stagnation_threshold` sim-seconds, it's wedged
+        # (possibly oscillating in tiny back-forth motions which would reset
+        # blocked_count). Force-reverse the cluster around the most-stagnant
+        # vehicle. Re-checked each substep so it triggers once per stall, and
+        # the high-water mark advances whenever real progress resumes.
+        stagnation_threshold = 0.5
+        most_stagnant: VehicleState | None = None
+        most_stalled = 0.0
+        for vehicle in movable:
+            path = vehicle.active_path
+            if path is None:
+                continue
+            vid = vehicle.vehicle_id
+            high = self._max_path_distance.get(vid, -1.0)
+            if path.distance > high + 1e-6:
+                self._max_path_distance[vid] = path.distance
+                self._max_path_time[vid] = self.sim_time
+                continue
+            stalled = self.sim_time - self._max_path_time.get(vid, self.sim_time)
+            if stalled > most_stalled:
+                most_stalled = stalled
+                most_stagnant = vehicle
+        if most_stagnant is not None and most_stalled >= stagnation_threshold:
+            if self._force_cluster_reverse(
+                movable,
+                max_distance,
+                current_owners,
+                current_positions,
+                anchor=most_stagnant,
+            ):
+                # Reverses move path.distance backward — re-arm the watermark
+                # so we don't immediately re-trigger.
+                for vehicle in movable:
+                    if vehicle.active_path is not None:
+                        self._max_path_distance[vehicle.vehicle_id] = vehicle.active_path.distance
+                        self._max_path_time[vehicle.vehicle_id] = self.sim_time
             if self.status_message.startswith("Traffic blocked"):
                 self.status_message = ""
+
+    def _lookahead_yield_travel(
+        self,
+        vehicle: VehicleState,
+        requested_travel: float,
+        max_distance_per_substep: float,
+    ) -> float:
+        """Predictive yield: project this vehicle and every higher-priority
+        vehicle along their paths over the next ~75 substeps (~1.5 sim-sec at
+        full speed). If a clearance violation is predicted at any future step,
+        return a smaller travel value that keeps the vehicle clear throughout
+        the lookahead window. Higher-priority vehicles are unaffected because
+        they don't yield — only the lower-priority side reduces speed.
+        """
+        path = vehicle.active_path
+        if path is None or requested_travel <= 1e-6:
+            return requested_travel
+        if max_distance_per_substep <= 0:
+            return requested_travel
+
+        lookahead_substeps = 40  # ~0.8 sim-seconds at full speed
+        my_priority = self._movement_priority(vehicle)
+        # Use the actual vehicle clearance, no extra margin — extra margin
+        # makes lower-priority vehicles yield too early, which causes new
+        # cluster pile-ups behind them.
+        min_clearance = self._minimum_vehicle_center_distance() * 1.05
+        # Skip lookahead entirely when no nearby vehicle could possibly
+        # conflict within the window — saves the expensive trajectory loop.
+        max_relative_speed = max_distance_per_substep * lookahead_substeps * 2.0
+        proximity_radius = max_relative_speed + min_clearance
+
+        higher_priority_others: List[Tuple[VehicleState, List[Coord]]] = []
+        for other in self.vehicles:
+            if other.vehicle_id == vehicle.vehicle_id:
+                continue
+            if other.completed or other.active_path is None:
+                continue
+            if other.waiting_customer_id is not None:
+                continue
+            if euclidean(vehicle.position, other.position) > proximity_radius:
+                continue
+            if self._movement_priority(other) <= my_priority:
+                continue
+            other_path = other.active_path
+            other_positions = []
+            for step in range(1, lookahead_substeps + 1):
+                d = min(
+                    other_path.distance + max_distance_per_substep * step,
+                    other_path.total_length,
+                )
+                other_positions.append(other_path.position_at(d))
+            higher_priority_others.append((other, other_positions))
+
+        if not higher_priority_others:
+            return requested_travel
+
+        start_d = path.distance
+        path_total = path.total_length
+
+        def keeps_clearance(this_step_travel: float) -> bool:
+            base = start_d + this_step_travel
+            for step in range(1, lookahead_substeps + 1):
+                my_d = base if step == 1 else base + max_distance_per_substep * (step - 1)
+                if my_d > path_total:
+                    my_d = path_total
+                my_pos = path.position_at(my_d)
+                for _other, other_positions in higher_priority_others:
+                    op = other_positions[step - 1]
+                    dx = my_pos[0] - op[0]
+                    dy = my_pos[1] - op[1]
+                    if dx * dx + dy * dy < min_clearance * min_clearance:
+                        return False
+            return True
+
+        if keeps_clearance(requested_travel):
+            return requested_travel
+
+        lo, hi = 0.0, requested_travel
+        for _ in range(10):
+            mid = (lo + hi) / 2.0
+            if keeps_clearance(mid):
+                lo = mid
+            else:
+                hi = mid
+        return max(0.0, lo)
 
     def _max_resource_safe_travel(
         self,
@@ -1111,6 +1431,23 @@ class SimulationApp:
             if feasible_candidates:
                 winner = self._choose_candidate_winner(feasible_candidates)
                 accepted.add(winner.vehicle.vehicle_id)
+                continue
+
+            # No feasible forward winner. For 3+ vehicle clearance deadlocks
+            # (the kind that wedge near the depot exit or in tight station
+            # clusters), try a coordinated multi-reverse: highest-priority
+            # member moves forward, the rest reverse simultaneously, ignoring
+            # resource conflicts between cluster members.
+            if len(component) >= 3:
+                cluster_ids = self._try_resolve_cluster_deadlock(
+                    component,
+                    candidates,
+                    max_distance,
+                    current_owners,
+                    current_positions,
+                )
+                if cluster_ids is not None:
+                    accepted.update(cluster_ids)
 
         return accepted
 
@@ -1167,6 +1504,283 @@ class SimulationApp:
 
         candidates[loser.vehicle.vehicle_id] = reverse_candidate
         return {winner.vehicle.vehicle_id, loser.vehicle.vehicle_id}
+
+    def _try_resolve_cluster_deadlock(
+        self,
+        component: List[MovementCandidate],
+        candidates: Dict[int, MovementCandidate],
+        max_distance: float,
+        current_owners: Dict[str, int],
+        current_positions: Dict[int, Coord],
+    ) -> Set[int] | None:
+        """N-way clearance-deadlock breaker.
+
+        Picks one cluster member as forward winner; everyone else reverses
+        simultaneously. Treat *intra-cluster* resource ownership as relaxed
+        (since the other owners are also stepping out of the way), but still
+        require all movements to be mutually conflict-free and clear against
+        stationary vehicles outside the cluster.
+        """
+        cluster_ids = {c.vehicle.vehicle_id for c in component}
+        ordered = sorted(
+            component,
+            key=lambda c: self._movement_priority(c.vehicle),
+            reverse=True,
+        )
+
+        for proposed_winner in ordered:
+            winner_id = proposed_winner.vehicle.vehicle_id
+            losers = [c for c in component if c.vehicle.vehicle_id != winner_id]
+
+            reverses: Dict[int, MovementCandidate] = {}
+            ok = True
+            for loser in losers:
+                reverse = self._build_relaxed_reverse_candidate(
+                    loser.vehicle,
+                    max_distance,
+                    current_owners,
+                    relaxed_against=cluster_ids,
+                )
+                if reverse is None:
+                    ok = False
+                    break
+                reverses[loser.vehicle.vehicle_id] = reverse
+            if not ok:
+                continue
+
+            # Winner forward must not collide with any reverse end-position.
+            if any(
+                self._movement_candidates_conflict(proposed_winner, rev)
+                for rev in reverses.values()
+            ):
+                continue
+
+            # Reverses must not collide with each other.
+            reverse_list = list(reverses.values())
+            mutually_clear = True
+            for i, a in enumerate(reverse_list):
+                for b in reverse_list[i + 1:]:
+                    if self._movement_candidates_conflict(a, b):
+                        mutually_clear = False
+                        break
+                if not mutually_clear:
+                    break
+            if not mutually_clear:
+                continue
+
+            # Reverses must clear stationary vehicles outside the cluster.
+            outside_clear = True
+            for rev in reverses.values():
+                if not self._candidate_clear_against_nonaccepted_vehicles(
+                    rev, current_positions, cluster_ids
+                ):
+                    outside_clear = False
+                    break
+            if not outside_clear:
+                continue
+
+            # All checks pass — apply the reverses and accept.
+            for vid, rev in reverses.items():
+                candidates[vid] = rev
+            return cluster_ids
+        return None
+
+    def _force_cluster_reverse(
+        self,
+        movable: List[VehicleState],
+        max_distance: float,
+        current_owners: Dict[str, int],
+        current_positions: Dict[int, Coord],
+        *,
+        anchor: VehicleState | None = None,
+    ) -> bool:
+        """Last-resort deadlock breaker.
+
+        Many of our deadlocks happen *before* vehicles ever become movement
+        candidates: each vehicle's `_max_resource_safe_travel` returns 0
+        because some resource on its next path segment is owned by another
+        stuck vehicle. The conflict graph never sees them, so the regular
+        backoff/cluster resolvers can't help.
+
+        Groups the stuck movable vehicles by spatial proximity, picks the
+        cluster containing `anchor` if given (else the most-blocked cluster),
+        and forces every member to reverse simultaneously, ignoring
+        intra-cluster resource ownership. After applying, resource ownership
+        cycles are broken and forward motion resumes next substep.
+        """
+        cluster_radius = 12.0
+        clusters = self._build_proximity_clusters(movable, cluster_radius)
+        if anchor is not None:
+            clusters = [
+                cluster for cluster in clusters
+                if any(v.vehicle_id == anchor.vehicle_id for v in cluster)
+            ]
+        else:
+            clusters.sort(
+                key=lambda cluster: -sum(self.blocked_counts.get(v.vehicle_id, 0) for v in cluster),
+            )
+
+        # Reverse distance must exceed the inter-vehicle clearance — anything
+        # smaller leaves the cluster geometry essentially unchanged. Reverse
+        # by ~2x clearance (roughly 7 inches) so the released resources truly
+        # become free for the stayer to advance into next substep.
+        reverse_distance = max_distance + 2.0 * self._minimum_vehicle_center_distance()
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            cluster_ids = {v.vehicle_id for v in cluster}
+
+            # Pick highest-priority member as the "stayer" — they keep their
+            # position so they have a chance to advance next substep once the
+            # others have cleared. Reversing every member makes the cluster
+            # oscillate forever (everyone retreats together, same conflict).
+            ordered = sorted(
+                cluster,
+                key=lambda v: self._movement_priority(v),
+                reverse=True,
+            )
+            stayer = ordered[0]
+            losers = ordered[1:]
+
+            reverses: Dict[int, MovementCandidate] = {}
+            for vehicle in losers:
+                rev = self._build_relaxed_reverse_candidate(
+                    vehicle,
+                    reverse_distance,
+                    current_owners,
+                    relaxed_against=cluster_ids,
+                )
+                if rev is not None:
+                    reverses[vehicle.vehicle_id] = rev
+            if not reverses:
+                self._warn_depot_message(
+                    f"force_reverse skipped cluster "
+                    f"{sorted(v.vehicle_id + 1 for v in cluster)} "
+                    f"(stayer V{stayer.vehicle_id + 1}): "
+                    f"no losers could build a reverse candidate"
+                )
+                continue
+
+            rev_list = list(reverses.values())
+            mutually_clear = True
+            conflict_pair = None
+            for i, a in enumerate(rev_list):
+                for b in rev_list[i + 1:]:
+                    if self._movement_candidates_conflict(a, b):
+                        mutually_clear = False
+                        conflict_pair = (a.vehicle.vehicle_id + 1, b.vehicle.vehicle_id + 1)
+                        break
+                if not mutually_clear:
+                    break
+            if not mutually_clear:
+                self._warn_depot_message(
+                    f"force_reverse rejected cluster "
+                    f"{sorted(v.vehicle_id + 1 for v in cluster)}: "
+                    f"reverse paths conflict between V{conflict_pair[0]} and V{conflict_pair[1]}"
+                )
+                continue
+
+            outside_failure = None
+            for rev in reverses.values():
+                if not self._candidate_clear_against_nonaccepted_vehicles(
+                    rev, current_positions, cluster_ids
+                ):
+                    outside_failure = rev.vehicle.vehicle_id + 1
+                    break
+            if outside_failure is not None:
+                self._warn_depot_message(
+                    f"force_reverse rejected cluster "
+                    f"{sorted(v.vehicle_id + 1 for v in cluster)}: "
+                    f"V{outside_failure}'s reverse conflicts with a vehicle outside the cluster"
+                )
+                continue
+
+            # Convert the planned reverse into a per-vehicle counter so the
+            # retreat plays out gradually at normal speed (~max_distance per
+            # substep) instead of teleporting in one frame. Other vehicles
+            # see the cluster member moving backward over many frames; the
+            # released forward resources clear progressively, breaking the
+            # deadlock without any visual jump.
+            substeps_per_reverse = max(
+                1,
+                int(round(reverse_distance / max(max_distance, 1e-6))),
+            )
+            self._warn_depot_message(
+                f"force_reverse SCHEDULED on cluster "
+                f"{sorted(v.vehicle_id + 1 for v in cluster)} "
+                f"(stayer V{stayer.vehicle_id + 1}, "
+                f"losers V{[v.vehicle_id + 1 for v in losers]} "
+                f"reverse over {substeps_per_reverse} substeps)"
+            )
+            for vid in reverses.keys():
+                vehicle_obj = next(v for v in losers if v.vehicle_id == vid)
+                vehicle_obj.yield_reverse_substeps_remaining = substeps_per_reverse
+                self.blocked_counts[vid] = 0
+            return True
+        return False
+
+    def _build_proximity_clusters(
+        self,
+        vehicles: List[VehicleState],
+        radius: float,
+    ) -> List[List[VehicleState]]:
+        visited: Set[int] = set()
+        clusters: List[List[VehicleState]] = []
+        for vehicle in vehicles:
+            if vehicle.vehicle_id in visited:
+                continue
+            cluster: List[VehicleState] = []
+            stack = [vehicle]
+            while stack:
+                current = stack.pop()
+                if current.vehicle_id in visited:
+                    continue
+                visited.add(current.vehicle_id)
+                cluster.append(current)
+                for other in vehicles:
+                    if other.vehicle_id in visited:
+                        continue
+                    if euclidean(current.position, other.position) <= radius:
+                        stack.append(other)
+            clusters.append(cluster)
+        return clusters
+
+    def _build_relaxed_reverse_candidate(
+        self,
+        vehicle: VehicleState,
+        max_distance: float,
+        current_owners: Dict[str, int],
+        *,
+        relaxed_against: Set[int],
+    ) -> MovementCandidate | None:
+        """Like _build_reverse_candidate, but ignores resource ownership held
+        by vehicles in `relaxed_against` (the rest of the deadlocked cluster)."""
+        path = vehicle.active_path
+        if path is None or path.distance <= 1e-6:
+            return None
+        start_distance = path.distance
+        end_distance = max(0.0, start_distance - max_distance)
+        resources = self._resources_for_path_range(path, end_distance, start_distance)
+        owned_now = self._vehicle_current_resources(vehicle)
+        for resource in resources:
+            if not self._is_exclusive_resource(resource):
+                continue
+            owner = current_owners.get(resource)
+            if (
+                owner is not None
+                and owner != vehicle.vehicle_id
+                and owner not in relaxed_against
+                and resource not in owned_now
+            ):
+                return None
+        return MovementCandidate(
+            vehicle=vehicle,
+            start_distance=start_distance,
+            end_distance=end_distance,
+            start_position=path.position_at(start_distance),
+            end_position=path.position_at(end_distance),
+            resources=resources,
+        )
 
     def _build_reverse_candidate(
         self,

@@ -134,6 +134,76 @@ def export_unity_json(
     return destination
 
 
+def capture_frame(app: SimulationApp) -> Dict[str, Any]:
+    """Public entry to capture a single frame from a running SimulationApp."""
+    return _capture_frame(app)
+
+
+def build_payload_from_recording(
+    app: SimulationApp,
+    frames: List[Dict[str, Any]],
+    *,
+    capture_interval_sec: float,
+    simulation_completed: bool,
+    termination_reason: str = "",
+) -> Dict[str, Any]:
+    """Build the JSON payload from an already-running app + captured frames.
+
+    Use this when you've recorded frames live (e.g., from pygame's run loop)
+    rather than running the headless export driver.
+    """
+    instance = app.instance
+    result = app.result
+    completion_time_sec = (
+        max((vehicle.completion_time or 0.0) for vehicle in app.vehicles)
+        if simulation_completed
+        else -1.0
+    )
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "generatedAtUtc": datetime.now(timezone.utc).isoformat(),
+        "coordinateMapping": {
+            "pygameXToUnity": "x",
+            "pygameYToUnity": "z",
+            "unityHeightAxis": "y",
+            "sourceUnits": "inches",
+            "recommendedUnityScale": 0.0254,
+        },
+        "worldSizeIn": config.WORLD_SIZE_IN,
+        "roadEnvelopeWidthIn": config.ROAD_ENVELOPE_WIDTH_IN,
+        "laneCenterOffsetIn": config.LANE_CENTER_OFFSET_IN,
+        "roadXs": [float(value) for value in instance.world.road_xs],
+        "roadYs": [float(value) for value in instance.world.road_ys],
+        "activeJobIds": [int(customer_id) for customer_id in instance.active_job_ids],
+        "vehicleCapacity": instance.capacity,
+        "vehicleCount": instance.vehicle_count,
+        "alvikSizeIn": config.ALVIK_SIZE_IN,
+        "alvikSpeedInPerSec": instance.instance_config.alvik_speed_in_per_sec,
+        "plannedMakespanSec": result.best.makespan,
+        "actualCompletionTimeSec": completion_time_sec,
+        "captureIntervalSec": capture_interval_sec,
+        "depot": _build_depot_data(instance),
+        "stations": _build_station_specs(instance),
+        "vehicles": _build_vehicle_specs(app),
+        "frames": frames,
+        "summary": _build_summary(
+            result,
+            frames,
+            completion_time_sec,
+            simulation_completed=simulation_completed,
+            terminated_at_sec=app.sim_time,
+            termination_reason=termination_reason,
+        ),
+    }
+
+
+def write_payload(output_path: str | Path, payload: Dict[str, Any]) -> Path:
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return destination
+
+
 def _build_summary(
     result: SolverRunResult,
     frames: List[Dict[str, Any]],

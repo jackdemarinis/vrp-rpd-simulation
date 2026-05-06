@@ -60,9 +60,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print depot return debug logs while the simulation is running.",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override solver/collision RNG seed. With fixed-timestep playback, same seed = same outcome every run.",
+    )
+    parser.add_argument(
         "--export-unity-json",
         default=None,
         help="Write a Unity playback snapshot JSON file and exit.",
+    )
+    parser.add_argument(
+        "--record-unity-json",
+        default=None,
+        help="Run pygame normally and record frames to this JSON file. Auto-quits when all vehicles complete.",
     )
     parser.add_argument(
         "--unity-capture-interval",
@@ -83,6 +94,7 @@ def main() -> None:
         fixed_processing_time=args.fixed_process_seconds,
         sim_speed=args.sim_speed,
         fullscreen=args.fullscreen,
+        seed=args.seed,
     )
     instance = build_instance(
         instance_config=runtime_config.instance,
@@ -134,6 +146,9 @@ def main() -> None:
         fullscreen=runtime_config.app.start_fullscreen,
         debug_depot=args.debug_depot,
         cache_config=runtime_config.cache,
+        record_unity_path=args.record_unity_json,
+        record_capture_interval_sec=args.unity_capture_interval,
+        auto_quit_on_complete=args.record_unity_json is not None,
     )
     app.run()
 
