@@ -5,63 +5,65 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame
 
-from vrp_rpd_sim import config
+from vrp_rpd_sim import cad_layout, config
 from vrp_rpd_sim.model import Operation
 from vrp_rpd_sim.solver import VRPRPDSolver
 from vrp_rpd_sim.world import build_instance, build_world
-from simulation_fixtures import build_fixture_app
 
 
-class DepotLayoutTests(unittest.TestCase):
-    TEST_JOB_COUNT = 16
-
+class CadLayoutWorldTests(unittest.TestCase):
     def tearDown(self) -> None:
         pygame.quit()
 
-    def test_depot_slots_form_three_by_three_grid(self) -> None:
-        world, _ = build_world()
-
-        xs = {round(slot[0], 3) for slot in world.depot_slots}
-        ys = {round(slot[1], 3) for slot in world.depot_slots}
-
-        self.assertEqual(9, len(world.depot_slots))
-        self.assertEqual(3, len(xs))
-        self.assertEqual(3, len(ys))
-
-    def test_depot_entry_points_geometry(self) -> None:
-        world, _ = build_world()
-
-        top_entries = [(round(x, 3), round(y, 3)) for x, y in world.depot_entries["top"]]
-        right_entries = [(round(x, 3), round(y, 3)) for x, y in world.depot_entries["right"]]
-
-        self.assertEqual(
-            [(1.97, 15.0), (6.5, 15.0), (11.03, 15.0)],
-            top_entries,
-        )
-        self.assertEqual(
-            [(15.0, 1.97), (15.0, 6.5), (15.0, 11.03)],
-            right_entries,
-        )
-
-    def test_stations_fill_all_road_enclosed_blocks(self) -> None:
+    def test_grid_has_eight_by_eight_intersections(self) -> None:
         world, stations = build_world()
 
-        self.assertEqual(36, len(stations))
-        self.assertEqual(
-            ((world.road_xs[0] + world.road_xs[1]) / 2.0, (world.road_ys[0] + world.road_ys[1]) / 2.0),
-            stations[0].coord,
-        )
-        self.assertEqual(
-            ((world.road_xs[5] + world.road_xs[6]) / 2.0, (world.road_ys[5] + world.road_ys[6]) / 2.0),
-            stations[-1].coord,
-        )
-        self.assertTrue(all(station.side == "interior" for station in stations))
-        for station in stations:
-            cx, cy = station.coord
-            self.assertGreater(cx, world.road_xs[0])
-            self.assertLess(cx, world.road_xs[-1])
-            self.assertGreater(cy, world.road_ys[0])
-            self.assertLess(cy, world.road_ys[-1])
+        self.assertEqual(8, len(world.road_xs))
+        self.assertEqual(8, len(world.road_ys))
+        self.assertEqual(64, len(stations))
+        self.assertTrue(all(station.side == "intersection" for station in stations))
+
+    def test_grid_pitch_matches_cad_layout(self) -> None:
+        world, _ = build_world()
+
+        for index, x in enumerate(cad_layout.GRID_XS):
+            self.assertAlmostEqual(world.road_xs[index], x, places=4)
+        for index, y in enumerate(cad_layout.GRID_YS):
+            self.assertAlmostEqual(world.road_ys[index], y, places=4)
+
+    def test_depot_has_ten_slots_in_l_shape(self) -> None:
+        world, _ = build_world()
+
+        self.assertEqual(10, len(world.depot_slots))
+        # First slot is the NE grid corner — doubles as a routing node.
+        self.assertEqual(cad_layout.GRID_CORNER_DEPOT_SLOT, world.depot_slots[0])
+        # Vertical arm slots share x = entry x.
+        for slot in cad_layout.DEPOT_VERTICAL_SLOTS:
+            self.assertIn(slot, world.depot_slots)
+        # Horizontal arm slots share y = arm y.
+        for slot in cad_layout.DEPOT_HORIZONTAL_SLOTS:
+            self.assertIn(slot, world.depot_slots)
+
+    def test_single_main_depot_entry(self) -> None:
+        world, _ = build_world()
+
+        self.assertIn("main", world.depot_entries)
+        self.assertEqual(1, len(world.depot_entries["main"]))
+        # Entry coincides with the NE grid intersection.
+        ne_corner_coord = world.coords[f"i_{len(world.road_xs) - 1}_{len(world.road_ys) - 1}"]
+        self.assertEqual(ne_corner_coord, world.depot_entries["main"][0])
+
+    def test_alvik_fleet_size_is_ten(self) -> None:
+        instance = build_instance()
+
+        self.assertEqual(10, config.ALVIK_COUNT)
+        self.assertEqual(10, instance.vehicle_count)
+
+    def test_default_instance_activates_all_64_stations(self) -> None:
+        instance = build_instance()
+
+        self.assertEqual(64, len(instance.stations))
+        self.assertEqual(64, len(instance.active_job_ids))
 
     def test_vehicle_capacity_is_four_and_five_drops_are_infeasible(self) -> None:
         instance = build_instance()
@@ -83,93 +85,6 @@ class DepotLayoutTests(unittest.TestCase):
         infeasible = solver.evaluate(infeasible_route, require_complete=False)
         self.assertFalse(infeasible.feasible)
         self.assertIn("Capacity violation", infeasible.reason)
-
-    def test_default_instance_activates_all_36_stations(self) -> None:
-        instance = build_instance()
-
-        self.assertEqual(36, len(instance.stations))
-        self.assertEqual(36, len(instance.active_job_ids))
-
-    def test_homebound_paths_end_at_assigned_slots(self) -> None:
-        app = build_fixture_app()
-        instance = app.instance
-        solver = app.solver
-
-        active_vehicles = [vehicle for vehicle in app.vehicles if vehicle.route]
-        for vehicle in active_vehicles:
-            last_stop = solver.customer_node(vehicle.route[-1].customer_id)
-            vehicle.current_node = last_stop
-            vehicle.position = instance.world.coords[last_stop]
-            vehicle.route_index = len(vehicle.route)
-            vehicle.active_path = None
-
-        app._assign_return_targets()
-        assigned_vehicles = [
-            vehicle
-            for vehicle in active_vehicles
-            if vehicle.return_slot_index is not None and not vehicle.completed
-        ]
-        self.assertGreaterEqual(len(assigned_vehicles), 2)
-
-        assigned_slots = []
-        for vehicle in assigned_vehicles:
-            path = app._travel_points(
-                vehicle.position,
-                vehicle.current_node,
-                instance.depot_node,
-                True,
-                home_slot=vehicle.home_slot,
-                depot_entry=vehicle.depot_entry,
-                depot_corridor=vehicle.depot_corridor,
-            )
-            self.assertEqual(vehicle.home_slot, path[-1])
-            self.assertIn(vehicle.depot_entry, path)
-            assigned_slots.append(vehicle.home_slot)
-
-        self.assertEqual(len(set(assigned_slots)), len(assigned_slots))
-
-    def test_corridor_stack_invariant_no_crossover(self) -> None:
-        app = build_fixture_app()
-
-        top_corridor_slots = app.depot_corridor_slots["top_1"]
-        self.assertEqual(
-            sorted(top_corridor_slots, key=lambda slot: (round(slot[1], 6), round(slot[0], 6))),
-            top_corridor_slots,
-        )
-
-        app.reserved_return_slots = {
-            slot for slot in app.depot_return_slots if slot not in set(top_corridor_slots)
-        }
-        app._refresh_corridor_frontier()
-
-        observed = []
-        for slot in top_corridor_slots:
-            observed.append(app.corridor_next_slot["top_1"])
-            app.reserved_return_slots.add(slot)
-            app._refresh_corridor_frontier()
-
-        self.assertEqual(top_corridor_slots, observed)
-
-    def test_homebound_assignments_do_not_skip_back_left_slots(self) -> None:
-        app = build_fixture_app()
-        for vehicle in app.vehicles:
-            if not vehicle.route:
-                continue
-            last_stop = app.solver.customer_node(vehicle.route[-1].customer_id)
-            vehicle.current_node = last_stop
-            vehicle.position = app.instance.world.coords[last_stop]
-            vehicle.route_index = len(vehicle.route)
-            vehicle.active_path = None
-
-        app._assign_return_targets()
-
-        assigned_indexes = sorted(
-            vehicle.return_slot_index
-            for vehicle in app.vehicles
-            if vehicle.return_slot_index is not None
-        )
-        self.assertGreaterEqual(len(assigned_indexes), 2)
-        self.assertEqual(list(range(len(assigned_indexes))), assigned_indexes)
 
 
 if __name__ == "__main__":

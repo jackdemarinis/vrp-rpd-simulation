@@ -1,7 +1,7 @@
 {
   "instance": {
-    "active_job_count": 36,
-    "vehicle_count": 9,
+    "active_job_count": 64,
+    "vehicle_count": 10,
     "vehicle_capacity": 4,
     "alvik_speed_in_per_sec": 5.118110236220472,
     "processing_time_variant": "base",
@@ -46,7 +46,7 @@
   "cache": {
     "enabled": true,
     "directory": ".solution_cache",
-    "schema_version": 1,
-    "algorithm_version": "2026-04-30"
+    "schema_version": 2,
+    "algorithm_version": "2026-05-21-cad"
   }
 }

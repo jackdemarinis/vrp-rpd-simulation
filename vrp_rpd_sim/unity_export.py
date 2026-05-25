@@ -85,8 +85,9 @@ def build_unity_export(
             "sourceUnits": "inches",
             "recommendedUnityScale": 0.0254,
         },
-        "worldSizeIn": config.WORLD_SIZE_IN,
-        "roadEnvelopeWidthIn": config.ROAD_ENVELOPE_WIDTH_IN,
+        "worldWidthIn": config.WORLD_WIDTH_IN,
+        "worldHeightIn": config.WORLD_HEIGHT_IN,
+        "roadWidthIn": config.ROAD_WIDTH_IN,
         "laneCenterOffsetIn": config.LANE_CENTER_OFFSET_IN,
         "roadXs": [float(value) for value in instance.world.road_xs],
         "roadYs": [float(value) for value in instance.world.road_ys],
@@ -169,8 +170,9 @@ def build_payload_from_recording(
             "sourceUnits": "inches",
             "recommendedUnityScale": 0.0254,
         },
-        "worldSizeIn": config.WORLD_SIZE_IN,
-        "roadEnvelopeWidthIn": config.ROAD_ENVELOPE_WIDTH_IN,
+        "worldWidthIn": config.WORLD_WIDTH_IN,
+        "worldHeightIn": config.WORLD_HEIGHT_IN,
+        "roadWidthIn": config.ROAD_WIDTH_IN,
         "laneCenterOffsetIn": config.LANE_CENTER_OFFSET_IN,
         "roadXs": [float(value) for value in instance.world.road_xs],
         "roadYs": [float(value) for value in instance.world.road_ys],
@@ -245,19 +247,12 @@ def _build_depot_data(instance) -> Dict[str, Any]:
         ],
         "entries": [
             {
-                "entryId": f"top_{index}",
-                "group": "top",
+                "entryId": f"{group}_{index}",
+                "group": group,
                 **_point_dict(point),
             }
-            for index, point in enumerate(instance.world.depot_entries["top"])
-        ]
-        + [
-            {
-                "entryId": f"right_{index}",
-                "group": "right",
-                **_point_dict(point),
-            }
-            for index, point in enumerate(instance.world.depot_entries["right"])
+            for group, points in instance.world.depot_entries.items()
+            for index, point in enumerate(points)
         ],
     }
 

@@ -1,4 +1,11 @@
-"""World geometry, graph generation, and processing-time setup."""
+"""World geometry, graph generation, and processing-time setup.
+
+The world matches `Physical Set Up/Configuration 1.obj`: an 8×8 grid of
+intersections with single-lane two-way roads, plus an L-shaped depot that
+hooks into the NE grid corner. All 64 grid intersections are stations.
+Depot parking has 10 slots (the NE corner doubles as both station and the
+first parking slot).
+"""
 
 from __future__ import annotations
 
@@ -9,7 +16,7 @@ from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, Iterable, List, Tuple
 
-from . import config
+from . import cad_layout, config
 from .model import Coord, Instance, Station, WorldGraph
 
 
@@ -60,75 +67,68 @@ def build_instance(
 
 
 def build_world() -> Tuple[WorldGraph, List[Station]]:
-    road_gap = _compute_road_gap(
-        config.WORLD_SIZE_IN,
-        config.ROAD_EDGE_MARGIN_IN,
-        config.ROAD_ENVELOPE_WIDTH_IN,
-        config.VERTICAL_ROAD_COUNT,
-    )
-    road_xs = _road_centers(config.VERTICAL_ROAD_COUNT, road_gap)
-    road_ys = _road_centers(config.HORIZONTAL_ROAD_COUNT, road_gap)
+    road_xs = list(cad_layout.GRID_XS)
+    road_ys = list(cad_layout.GRID_YS)
 
     coords: Dict[str, Coord] = {}
     edges: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
 
-    bottom_nodes = []
-    top_nodes = []
-    left_nodes = []
-    right_nodes = []
-
+    # 64 grid intersections, indexed (ix, iy) with ix=col, iy=row, SW origin.
     for ix, x in enumerate(road_xs):
-        bottom_id = f"vbot_{ix}"
-        top_id = f"vtop_{ix}"
-        coords[bottom_id] = (x, 0.0)
-        coords[top_id] = (x, config.WORLD_SIZE_IN)
-        bottom_nodes.append(bottom_id)
-        top_nodes.append(top_id)
-
-    for iy, y in enumerate(road_ys):
-        left_id = f"hleft_{iy}"
-        right_id = f"hright_{iy}"
-        coords[left_id] = (0.0, y)
-        coords[right_id] = (config.WORLD_SIZE_IN, y)
-        left_nodes.append(left_id)
-        right_nodes.append(right_id)
-
-    for ix, x in enumerate(road_xs):
-        column_nodes = [bottom_nodes[ix]]
         for iy, y in enumerate(road_ys):
-            node_id = f"i_{ix}_{iy}"
-            coords[node_id] = (x, y)
-            column_nodes.append(node_id)
-        column_nodes.append(top_nodes[ix])
-        _connect_consecutive(coords, edges, column_nodes, axis="y")
+            coords[_grid_node_id(ix, iy)] = (x, y)
 
-    for iy, y in enumerate(road_ys):
-        row_nodes = [left_nodes[iy]]
-        for ix, x in enumerate(road_xs):
-            row_nodes.append(f"i_{ix}_{iy}")
-        row_nodes.append(right_nodes[iy])
-        _connect_consecutive(coords, edges, row_nodes, axis="x")
+    # Bidirectional edges between adjacent grid intersections.
+    for ix in range(len(road_xs)):
+        for iy in range(len(road_ys) - 1):
+            _add_edge(
+                edges,
+                _grid_node_id(ix, iy),
+                _grid_node_id(ix, iy + 1),
+                abs(road_ys[iy + 1] - road_ys[iy]),
+            )
+    for iy in range(len(road_ys)):
+        for ix in range(len(road_xs) - 1):
+            _add_edge(
+                edges,
+                _grid_node_id(ix, iy),
+                _grid_node_id(ix + 1, iy),
+                abs(road_xs[ix + 1] - road_xs[ix]),
+            )
 
-    stations = _build_interior_stations(coords, edges, road_xs, road_ys)
+    # All 64 grid intersections are stations. station_id 1..64, row-major
+    # from SW so id 1 = (col 0, row 0) and id 64 = (col 7, row 7).
+    stations: List[Station] = []
+    station_id = 1
+    for iy in range(len(road_ys)):
+        for ix in range(len(road_xs)):
+            node_id = _grid_node_id(ix, iy)
+            stations.append(
+                Station(
+                    station_id=station_id,
+                    name=str(station_id),
+                    side="intersection",
+                    node_id=node_id,
+                    coord=coords[node_id],
+                )
+            )
+            station_id += 1
 
+    # Depot abstract node sits coincident with the NE grid corner. Outgoing
+    # vehicles transition depot → i_7_7 with zero travel cost; inbound
+    # vehicles do the reverse. The depot's physical L-shape (9 extra dots)
+    # is handled outside the routing graph by the render-layer corridor
+    # logic, similar to how the prior 3×3 depot was handled.
     depot_node = "depot"
-    depot_access = _depot_access_coord(road_xs, road_ys)
-    coords[depot_node] = depot_access
-    _add_edge(
-        edges,
-        depot_node,
-        bottom_nodes[0],
-        abs(coords[depot_node][1] - 0.0),
-    )
-    _add_edge(
-        edges,
-        depot_node,
-        left_nodes[0],
-        abs(coords[depot_node][0] - 0.0),
-    )
+    grid_ne_corner = _grid_node_id(len(road_xs) - 1, len(road_ys) - 1)
+    coords[depot_node] = coords[grid_ne_corner]
+    _add_edge(edges, depot_node, grid_ne_corner, 0.0)
 
     distances, shortest_paths = _all_pairs_shortest_paths(coords, edges)
-    depot_slots = _build_depot_slots(config.DEPOT_ANCHOR_IN)
+
+    depot_slots = list(cad_layout.ALL_DEPOT_SLOTS)
+    depot_entries = {"main": [coords[depot_node]]}
+
     world = WorldGraph(
         coords=coords,
         edges=dict(edges),
@@ -138,8 +138,8 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
         road_ys=road_ys,
         depot_anchor=config.DEPOT_ANCHOR_IN,
         depot_slots=depot_slots,
-        depot_entries=_depot_entry_points(road_xs, road_ys, depot_slots),
-        road_gap_in=road_gap,
+        depot_entries=depot_entries,
+        road_gap_in=cad_layout.GRID_PITCH_IN,
         lane_center_offset_in=config.LANE_CENTER_OFFSET_IN,
     )
     return world, stations
@@ -161,8 +161,11 @@ def build_processing_times(
                 continue
             distance = world.distances[station_a.node_id][station_b.node_id]
             travel_values.append(distance / instance_config.alvik_speed_in_per_sec)
-    d_min = min(travel_values)
-    d_max = max(travel_values)
+    if not travel_values:
+        d_min = d_max = 0.0
+    else:
+        d_min = min(travel_values)
+        d_max = max(travel_values)
 
     rng = random.Random(instance_config.processing_time_seed)
     base_times = {
@@ -233,39 +236,8 @@ def select_active_job_ids(stations: Iterable[Station], count: int) -> List[int]:
     return selected
 
 
-def _compute_road_gap(
-    world_size: float,
-    edge_margin: float,
-    road_width: float,
-    road_count: int,
-) -> float:
-    usable = world_size - (2.0 * edge_margin) - (road_count * road_width)
-    if usable <= 0:
-        raise ValueError("World is too small for the requested road layout.")
-    return usable / (road_count - 1)
-
-
-def _road_centers(count: int, road_gap: float) -> List[float]:
-    centers = []
-    center = config.ROAD_EDGE_MARGIN_IN + (config.ROAD_ENVELOPE_WIDTH_IN / 2.0)
-    pitch = config.ROAD_ENVELOPE_WIDTH_IN + road_gap
-    for index in range(count):
-        centers.append(center + (index * pitch))
-    return centers
-
-
-def _connect_consecutive(
-    coords: Dict[str, Coord],
-    edges: Dict[str, List[Tuple[str, float]]],
-    node_ids: List[str],
-    axis: str,
-) -> None:
-    for left, right in zip(node_ids, node_ids[1:]):
-        if axis == "x":
-            weight = abs(coords[right][0] - coords[left][0])
-        else:
-            weight = abs(coords[right][1] - coords[left][1])
-        _add_edge(edges, left, right, weight)
+def _grid_node_id(ix: int, iy: int) -> str:
+    return f"i_{ix}_{iy}"
 
 
 def _add_edge(
@@ -276,94 +248,6 @@ def _add_edge(
 ) -> None:
     edges[source].append((target, weight))
     edges[target].append((source, weight))
-
-
-def _build_depot_slots(anchor: Coord) -> List[Coord]:
-    slots = []
-    step = config.ALVIK_SIZE_IN + config.DEPOT_STACK_GAP_IN
-    x_offset = ((config.DEPOT_STACK_COLUMNS - 1) * step) / 2.0
-    y_offset = ((config.DEPOT_STACK_ROWS - 1) * step) / 2.0
-    for row in range(config.DEPOT_STACK_ROWS):
-        for col in range(config.DEPOT_STACK_COLUMNS):
-            x = anchor[0] - x_offset + (col * step)
-            y = anchor[1] - y_offset + (row * step)
-            slots.append((x, y))
-    return slots[: config.ALVIK_COUNT]
-
-
-def _depot_access_coord(road_xs: List[float], road_ys: List[float]) -> Coord:
-    # Anchor at the SW corner of the SW intersection so outgoing traffic in either
-    # direction (N on the leftmost road's east-of-centerline lane after flip is the
-    # +X side; E on the bottom road's south-of-centerline lane is the -Y side) can
-    # depart without re-entering the depot control zone. Incoming W-bound traffic
-    # turns south at (road_xs[0] - LANE, road_ys[0] + LANE) before reaching here.
-    return (
-        road_xs[0] - config.LANE_CENTER_OFFSET_IN,
-        road_ys[0] - config.LANE_CENTER_OFFSET_IN,
-    )
-
-
-def _depot_entry_points(
-    road_xs: List[float],
-    road_ys: List[float],
-    depot_slots: List[Coord],
-) -> Dict[str, List[Coord]]:
-    col_xs = sorted({round(x, 6) for x, _ in depot_slots})
-    row_ys = sorted({round(y, 6) for _, y in depot_slots})
-    top_y = road_ys[0] - config.DEPOT_ENTRY_LANE_OFFSET_IN
-    right_x = road_xs[0] - config.DEPOT_ENTRY_LANE_OFFSET_IN
-    return {
-        "top": [(x, top_y) for x in col_xs[: config.DEPOT_ENTRY_TOP_COUNT]],
-        "right": [(right_x, y) for y in row_ys[: config.DEPOT_ENTRY_RIGHT_COUNT]],
-    }
-
-
-def _interior_block_centers(
-    road_xs: List[float],
-    road_ys: List[float],
-) -> List[Tuple[int, int, Coord]]:
-    """Return row-major road-enclosed block centers from bottom-left upward."""
-    blocks: List[Tuple[int, int, Coord]] = []
-    for iy in range(len(road_ys) - 1):
-        cy = (road_ys[iy] + road_ys[iy + 1]) / 2.0
-        for ix in range(len(road_xs) - 1):
-            cx = (road_xs[ix] + road_xs[ix + 1]) / 2.0
-            blocks.append((ix, iy, (cx, cy)))
-    return blocks
-
-
-def _build_interior_stations(
-    coords: Dict[str, Coord],
-    edges: Dict[str, List[Tuple[str, float]]],
-    road_xs: List[float],
-    road_ys: List[float],
-) -> List[Station]:
-    stations: List[Station] = []
-    for station_id, (ix, iy, coord) in enumerate(_interior_block_centers(road_xs, road_ys), start=1):
-        node_id = f"station_{station_id:02d}"
-        access_node_id = f"station_access_{station_id:02d}"
-        access_coord = (coord[0], road_ys[iy + 1])
-        coords[node_id] = coord
-        coords[access_node_id] = access_coord
-
-        _add_edge(edges, node_id, access_node_id, abs(access_coord[1] - coord[1]))
-        if ix < ((len(road_xs) - 1) // 2):
-            anchor_node = f"i_{ix + 1}_{iy + 1}"
-            anchor_distance = abs(road_xs[ix + 1] - access_coord[0])
-        else:
-            anchor_node = f"i_{ix}_{iy + 1}"
-            anchor_distance = abs(access_coord[0] - road_xs[ix])
-        _add_edge(edges, access_node_id, anchor_node, anchor_distance)
-        stations.append(
-            Station(
-                station_id=station_id,
-                name=str(station_id),
-                side="interior",
-                node_id=node_id,
-                coord=coord,
-            )
-        )
-    return stations
 
 
 def _all_pairs_shortest_paths(

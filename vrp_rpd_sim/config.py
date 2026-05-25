@@ -7,25 +7,33 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import cad_layout
+
 # World geometry -------------------------------------------------------------
+#
+# Sourced from `Physical Set Up/Configuration 1.obj`. The 8x8 grid sits with
+# its SW intersection at (0,0). The depot is an L-shape that hooks into the
+# NE grid corner. See `vrp_rpd_sim.cad_layout` for the raw coordinates.
 
-WORLD_SIZE_IN = 120.0  # 10 ft x 10 ft
+WORLD_WIDTH_IN = cad_layout.WORLD_WIDTH_IN
+WORLD_HEIGHT_IN = cad_layout.WORLD_HEIGHT_IN
+WORLD_MIN = cad_layout.WORLD_MIN
+WORLD_MAX = cad_layout.WORLD_MAX
 
-VERTICAL_ROAD_COUNT = 7
-HORIZONTAL_ROAD_COUNT = 7
+# Road visual width — single lane, two-way. Wide enough for one Alvik plus
+# a little visual padding so traffic reads as on-road.
+ROAD_WIDTH_IN = 4.0
 
-ROAD_STRIP_WIDTH_IN = 2.0
-ROAD_MEDIAN_GAP_IN = 3.0
-ROAD_ENVELOPE_WIDTH_IN = (2 * ROAD_STRIP_WIDTH_IN) + ROAD_MEDIAN_GAP_IN
-LANE_DIVIDER_COLOR = (230, 190, 60)
-LANE_DIVIDER_WIDTH_IN = 0.25
-LANE_DIVIDER_DASH_IN = 2.0
-LANE_DIVIDER_GAP_IN = 2.0
+# Lane center offset: 0 in the new world. Roads are single-lane, so the
+# lane center is the road center. Kept for backward compat with the
+# solver's `_lane_point` helper, which still consults this value.
+LANE_CENTER_OFFSET_IN = 0.0
 
-# Inferred from the user's requested depot footprint plus the required
-# 7x7 Manhattan network. The paper itself uses a distance matrix rather
-# than physical geometry, so this spacing is intentionally editable.
-ROAD_EDGE_MARGIN_IN = 14.0
+# Right-hand traffic flag is moot in single-lane world but the solver
+# multiplies by LANE_DIRECTION_SIGN, so keep it at 1 (no effect when
+# the offset is 0).
+DRIVE_SIDE_RIGHT = True
+LANE_DIRECTION_SIGN = 1 if DRIVE_SIDE_RIGHT else -1
 
 # Alvik and depot ------------------------------------------------------------
 
@@ -33,29 +41,31 @@ ALVIK_SIZE_CM = 9.6
 ALVIK_SIZE_IN = ALVIK_SIZE_CM / 2.54
 MIN_ALVIK_CLEARANCE_IN = 0.5
 
-ALVIK_COUNT = 9
+# Bumped from 9 → 10 to match the CAD depot (7-arm + 2-vertical + grid-corner).
+ALVIK_COUNT = cad_layout.ALVIK_COUNT
 
 # The paper separates transport vehicles from identical resources. This demo
-# uses the 9 visible Alviks as the transport agents and keeps capacity editable.
+# uses the visible Alviks as the transport agents and keeps capacity editable.
 VEHICLE_CAPACITY = 4
 
-DEPOT_STACK_COLUMNS = 3
-DEPOT_STACK_ROWS = 3
-# Slightly larger than the minimum clearance so robots can peel out of the
-# waffle stack without immediate deadlock while still respecting the
-# 0.5-inch minimum robot-to-robot spacing.
-DEPOT_STACK_GAP_IN = 0.75
-DEPOT_ANCHOR_IN = (6.5, 6.5)
+# Reference anchor for the depot. Sweep clustering in the solver uses this
+# point for the atan2 polar sort. We pick the centroid of the 10 parking
+# slots so the angular ordering wraps the whole queue.
+DEPOT_ANCHOR_IN = (
+    sum(x for x, _ in cad_layout.ALL_DEPOT_SLOTS) / len(cad_layout.ALL_DEPOT_SLOTS),
+    sum(y for _, y in cad_layout.ALL_DEPOT_SLOTS) / len(cad_layout.ALL_DEPOT_SLOTS),
+)
 
 # Stations and processing ----------------------------------------------------
 
-ACTIVE_JOB_COUNT = 36
+# All 64 grid intersections are stations now (vs. 36 interior-block stations
+# in the old synthetic world).
+ACTIVE_JOB_COUNT = 64
 PROCESSING_TIME_VARIANT = "base"  # "base", "2x", "5x", "1R10", "1R20"
 PROCESSING_TIME_SEED = 7
 PROCESSING_TIME_SCALE = 1.0
 FIXED_PROCESSING_TIME_SEC = None
 
-# Optional explicit overrides in simulation seconds.
 PROCESSING_TIME_OVERRIDES: dict[int, float] = {}
 
 # Motion and animation -------------------------------------------------------
@@ -74,18 +84,6 @@ HUD_WIDTH_PX = 280
 MIN_WINDOW_WIDTH_PX = 980
 MIN_WINDOW_HEIGHT_PX = 760
 START_FULLSCREEN = False
-DEPOT_APPROACH_RESERVATION_IN = ROAD_ENVELOPE_WIDTH_IN + ALVIK_SIZE_IN + MIN_ALVIK_CLEARANCE_IN
-
-# Display lane center on each duct-tape strip rather than the road midpoint.
-LANE_CENTER_OFFSET_IN = (ROAD_MEDIAN_GAP_IN / 2.0) + (ROAD_STRIP_WIDTH_IN / 2.0)
-DEPOT_ENTRY_LANE_OFFSET_IN = LANE_CENTER_OFFSET_IN
-DEPOT_ENTRY_TOP_COUNT = 3
-DEPOT_ENTRY_RIGHT_COUNT = 3
-
-# Right-hand traffic: northbound on east half (+X), eastbound on south half (-Y).
-# Flip to False for left-hand traffic.
-DRIVE_SIDE_RIGHT = True
-LANE_DIRECTION_SIGN = 1 if DRIVE_SIDE_RIGHT else -1
 
 # Solver --------------------------------------------------------------------
 
@@ -124,8 +122,8 @@ BRKGA_INFEASIBILITY_PENALTY = 10**6
 
 DEFAULT_RUNTIME_CONFIG_PATH = Path("simulation_config.json")
 DEFAULT_SOLUTION_CACHE_DIR = ".solution_cache"
-SOLUTION_CACHE_SCHEMA_VERSION = 1
-SOLUTION_CACHE_ALGORITHM_VERSION = "2026-04-30"
+SOLUTION_CACHE_SCHEMA_VERSION = 2
+SOLUTION_CACHE_ALGORITHM_VERSION = "2026-05-21-cad"
 
 
 @dataclass(frozen=True)
@@ -337,4 +335,4 @@ def _load_dataclass[T](
 
 # Misc ----------------------------------------------------------------------
 
-APP_TITLE = "VRP-RPD Manhattan Grid Simulation"
+APP_TITLE = "VRP-RPD CAD-Layout Simulation"

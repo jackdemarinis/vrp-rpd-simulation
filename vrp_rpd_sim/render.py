@@ -9,7 +9,7 @@ from typing import Dict, List, Set, Tuple
 
 import pygame
 
-from . import config
+from . import cad_layout, config
 from .model import Instance, Operation
 from .solution_cache import solve_with_solution_cache
 from .solver import SolverRunResult, VRPRPDSolver, orthogonalize_points
@@ -418,9 +418,12 @@ class SimulationApp:
         hud_width = min(max(250, int(screen_w * 0.23)), 340)
         world_w = max(300, screen_w - hud_width - (3 * padding))
         world_h = max(300, screen_h - (2 * padding))
-        self.world_scale = min(world_w / config.WORLD_SIZE_IN, world_h / config.WORLD_SIZE_IN)
-        self.world_width_px = config.WORLD_SIZE_IN * self.world_scale
-        self.world_height_px = config.WORLD_SIZE_IN * self.world_scale
+        self.world_scale = min(
+            world_w / config.WORLD_WIDTH_IN,
+            world_h / config.WORLD_HEIGHT_IN,
+        )
+        self.world_width_px = config.WORLD_WIDTH_IN * self.world_scale
+        self.world_height_px = config.WORLD_HEIGHT_IN * self.world_scale
         self.world_left_px = padding
         self.world_top_px = (screen_h - self.world_height_px) / 2.0
         self.hud_left_px = self.world_left_px + self.world_width_px + padding
@@ -484,37 +487,24 @@ class SimulationApp:
         return vehicles
 
     def _build_depot_return_topology(self) -> None:
+        # The new CAD depot has a single L-shaped corridor with one entry at
+        # the NE grid corner. Slots are listed deepest-first so the corridor
+        # frontier picks the back of the queue first; that's the only safe
+        # parking order when every robot enters and exits through the same
+        # mouth.
         self.depot_corridor_entries = {}
         self.depot_corridor_slots = {}
         self.slot_corridors = {}
 
-        slots_by_x: Dict[float, List[Coord]] = {}
-        slots_by_y: Dict[float, List[Coord]] = {}
-        for slot in self.instance.world.depot_slots:
-            slots_by_x.setdefault(round(slot[0], 6), []).append(slot)
-            slots_by_y.setdefault(round(slot[1], 6), []).append(slot)
+        main_entry = self.instance.world.depot_entries["main"][0]
+        approach_order = list(self.instance.world.depot_slots)
+        deepest_first = list(reversed(approach_order))
 
-        for index, entry in enumerate(self.instance.world.depot_entries["top"]):
-            corridor_id = f"top_{index}"
-            ordered_slots = sorted(
-                slots_by_x.get(round(entry[0], 6), []),
-                key=lambda slot: (round(slot[1], 6), round(slot[0], 6)),
-            )
-            self.depot_corridor_entries[corridor_id] = entry
-            self.depot_corridor_slots[corridor_id] = ordered_slots
-            for slot in ordered_slots:
-                self.slot_corridors.setdefault(slot, []).append(corridor_id)
-
-        for index, entry in enumerate(self.instance.world.depot_entries["right"]):
-            corridor_id = f"right_{index}"
-            ordered_slots = sorted(
-                slots_by_y.get(round(entry[1], 6), []),
-                key=lambda slot: (round(slot[0], 6), round(slot[1], 6)),
-            )
-            self.depot_corridor_entries[corridor_id] = entry
-            self.depot_corridor_slots[corridor_id] = ordered_slots
-            for slot in ordered_slots:
-                self.slot_corridors.setdefault(slot, []).append(corridor_id)
+        corridor_id = "main"
+        self.depot_corridor_entries[corridor_id] = main_entry
+        self.depot_corridor_slots[corridor_id] = deepest_first
+        for slot in deepest_first:
+            self.slot_corridors.setdefault(slot, []).append(corridor_id)
 
         self._refresh_corridor_frontier()
 
@@ -2189,18 +2179,39 @@ class SimulationApp:
     def _depot_departure_phase(self, vehicle: VehicleState) -> int:
         if vehicle.current_node != self.instance.depot_node or vehicle.route_index >= len(vehicle.route):
             return 0
-        depot_edge_x = self.instance.world.depot_entries["right"][0][0]
-        road_lane_y = self.instance.world.road_ys[0]
-        if vehicle.position[1] < road_lane_y - 1e-6:
+        entry = self.instance.world.depot_entries["main"][0]
+        arm_y = cad_layout.DEPOT_ARM_Y_IN
+        if vehicle.position[1] <= entry[1] + 1e-6:
+            # Vehicle has reached (or passed) the entry — it's on the grid.
             return 3
-        if vehicle.position[0] < depot_edge_x - 1e-6:
-            return 2
-        return 1
+        on_arm = (
+            math.isclose(vehicle.position[1], arm_y, abs_tol=1e-6)
+            and abs(vehicle.position[0] - entry[0]) > 1e-6
+        )
+        if on_arm:
+            return 1  # still on the horizontal arm
+        return 2  # on the vertical column heading toward the entry
 
     def _is_in_depot_control_zone(self, position: Coord) -> bool:
-        depot_edge_x = self.instance.world.depot_entries["right"][0][0]
-        road_lane_y = self.instance.world.road_ys[0]
-        return position[0] <= depot_edge_x + 1e-6 and position[1] <= road_lane_y + 1e-6
+        # The depot's exclusive zone is the L corridor itself — the vertical
+        # column above the entry, plus the horizontal arm. The entry point
+        # at the NE grid corner is the boundary, not part of the zone, so a
+        # vehicle that has reached (69.16, 69.16) is considered to have
+        # exited the depot. This is critical: a too-broad zone (e.g., the
+        # entire top row of the grid) deadlocks all queued vehicles while
+        # the leading vehicle traverses along y = entry.y.
+        entry = self.instance.world.depot_entries["main"][0]
+        arm_y = cad_layout.DEPOT_ARM_Y_IN
+        epsilon = 1e-3
+        on_column = (
+            abs(position[0] - entry[0]) < epsilon
+            and position[1] > entry[1] + epsilon
+        )
+        on_arm = (
+            abs(position[1] - arm_y) < epsilon
+            and position[0] < entry[0] + epsilon
+        )
+        return on_column or on_arm
 
     def _resolve_arrivals(self) -> None:
         for vehicle in self.vehicles:
@@ -2282,25 +2293,15 @@ class SimulationApp:
             return dedupe_points(points)
 
         network_points = self.solver.path_coords(current_node, target_node)
-        if current_node == self.instance.depot_node:
-            network_points = self._trim_depot_boundary_hop(network_points, from_start=True)
-        if target_node == self.instance.depot_node:
-            network_points = self._trim_depot_boundary_hop(network_points, from_start=False)
         points.extend(network_points)
         if returning_home and home_slot is not None:
             points.extend(self._depot_access_to_slot(depot_access, home_slot))
         return dedupe_points(points)
 
     def _depot_departure_points(self, slot: Coord, depot_access: Coord) -> List[Coord]:
-        slot_x, slot_y = slot
-        top_y = self.instance.world.depot_entries["top"][0][1]
-        right_x = self.instance.world.depot_entries["right"][0][0]
-
-        if self._uses_right_departure_corridor(slot):
-            return dedupe_points([slot, (right_x, slot_y), depot_access])
-
-        corner = self._depot_entry_corner()
-        return dedupe_points([slot, (slot_x, top_y), corner, depot_access])
+        # Drive out of the L corridor: slot → (entry corner if on horizontal arm) → entry.
+        # `depot_access` is the L's entry coord (the NE grid corner).
+        return dedupe_points([slot, *self._l_path(slot, depot_access)])
 
     def _depot_departure_control_zone_occupied(self, *, exclude_vehicle_id: int | None = None) -> bool:
         for other in self.vehicles:
@@ -2314,39 +2315,22 @@ class SimulationApp:
                 return True
         return False
 
-    def _uses_right_departure_corridor(self, slot: Coord) -> bool:
-        slot_x, slot_y = slot
-        top_row_y = max(y for _, y in self.instance.world.depot_slots)
-        right_col_x = max(x for x, _ in self.instance.world.depot_slots)
-        return (
-            math.isclose(slot_x, right_col_x)
-            or (slot_x > slot_y and not math.isclose(slot_y, top_row_y))
-        )
-
     def _depot_parking_points(
         self,
         current_position: Coord,
         home_slot: Coord,
     ) -> List[Coord]:
-        points = [current_position]
-        if not math.isclose(current_position[0], home_slot[0]):
-            points.append((home_slot[0], current_position[1]))
-        if not (
-            math.isclose(current_position[0], home_slot[0])
-            and math.isclose(current_position[1], home_slot[1])
-        ):
-            points.append(home_slot)
-        return dedupe_points(points)
+        if euclidean(current_position, home_slot) <= 1e-6:
+            return dedupe_points([current_position])
+        depot_access = self.instance.world.coords[self.instance.depot_node]
+        path: List[Coord] = [current_position]
+        if euclidean(current_position, depot_access) > 1e-6:
+            path.extend(self._l_path(current_position, depot_access))
+        path.extend(self._l_path(depot_access, home_slot))
+        return dedupe_points(path)
 
     def _depot_access_to_slot(self, depot_access: Coord, slot: Coord) -> List[Coord]:
-        slot_x, slot_y = slot
-        _, access_y = depot_access
-        points = []
-        if not math.isclose(slot_x, depot_access[0]):
-            points.append((slot_x, access_y))
-        if not (math.isclose(slot_x, depot_access[0]) and math.isclose(slot_y, access_y)):
-            points.append(slot)
-        return points
+        return self._l_path(depot_access, slot)
 
     def _return_to_depot_entry_coords(
         self,
@@ -2355,18 +2339,9 @@ class SimulationApp:
         depot_corridor: str,
     ) -> List[Coord]:
         points = self.solver.path_coords(current_node, self.instance.depot_node)
-        points = self._trim_depot_boundary_hop(points, from_start=False)
         depot_access = self.instance.world.coords[self.instance.depot_node]
         if points and euclidean(points[-1], depot_access) <= 1e-6:
             points = points[:-1]
-        if points and self._is_boundary_point(points[-1]):
-            points = points[:-1]
-
-        if depot_corridor.startswith("right"):
-            corner = self._depot_entry_corner()
-            if not points or euclidean(points[-1], corner) > 1e-6:
-                points.append(corner)
-
         if not points or euclidean(points[-1], depot_entry) > 1e-6:
             points.append(depot_entry)
         return orthogonalize_points(dedupe_points(points))
@@ -2377,48 +2352,46 @@ class SimulationApp:
         slot: Coord,
         depot_corridor: str,
     ) -> List[Coord]:
-        points = []
-        if depot_corridor.startswith("top"):
-            if not math.isclose(depot_entry[0], slot[0]):
-                points.append((slot[0], depot_entry[1]))
+        return self._l_path(depot_entry, slot)
+
+    def _l_path(self, start: Coord, end: Coord) -> List[Coord]:
+        """Polyline from `start` to `end` along the L-shaped depot corridor.
+
+        `start` and `end` must lie on the L (entry, vertical arm, or
+        horizontal arm). Returns the intermediate + end points (omits the
+        leading `start`). Empty list if start == end.
+        """
+        if euclidean(start, end) <= 1e-6:
+            return []
+        entry = self.instance.world.depot_entries["main"][0]
+        arm_y = cad_layout.DEPOT_ARM_Y_IN
+
+        def on_horizontal_arm(point: Coord) -> bool:
+            return (
+                math.isclose(point[1], arm_y, abs_tol=1e-6)
+                and abs(point[0] - entry[0]) > 1e-6
+            )
+
+        start_on_arm = on_horizontal_arm(start)
+        end_on_arm = on_horizontal_arm(end)
+        corner = (entry[0], arm_y)
+
+        points: List[Coord] = []
+        if start_on_arm and end_on_arm:
+            points.append(end)
+        elif start_on_arm and not end_on_arm:
+            if euclidean(start, corner) > 1e-6:
+                points.append(corner)
+            if euclidean(points[-1] if points else start, end) > 1e-6:
+                points.append(end)
+        elif not start_on_arm and end_on_arm:
+            if euclidean(start, corner) > 1e-6:
+                points.append(corner)
+            if euclidean(points[-1] if points else start, end) > 1e-6:
+                points.append(end)
         else:
-            if not math.isclose(depot_entry[1], slot[1]):
-                points.append((depot_entry[0], slot[1]))
-        if euclidean(depot_entry, slot) > 1e-6:
-            points.append(slot)
+            points.append(end)
         return points
-
-    def _depot_entry_corner(self) -> Coord:
-        top_y = self.instance.world.depot_entries["top"][0][1]
-        right_x = self.instance.world.depot_entries["right"][0][0]
-        return (right_x, top_y)
-
-    def _trim_depot_boundary_hop(
-        self,
-        points: List[Coord],
-        *,
-        from_start: bool,
-    ) -> List[Coord]:
-        if len(points) < 3:
-            return points
-        boundary_index = 1 if from_start else -2
-        depot_index = 0 if from_start else -1
-        boundary = points[boundary_index]
-        depot_access = points[depot_index]
-        if not self._is_boundary_point(boundary) or self._is_boundary_point(depot_access):
-            return points
-        trimmed = list(points)
-        trimmed.pop(boundary_index)
-        return trimmed
-
-    def _is_boundary_point(self, point: Coord) -> bool:
-        x, y = point
-        return (
-            math.isclose(x, 0.0)
-            or math.isclose(y, 0.0)
-            or math.isclose(x, config.WORLD_SIZE_IN)
-            or math.isclose(y, config.WORLD_SIZE_IN)
-        )
 
     def _draw(self) -> None:
         self.screen.fill(BG)
@@ -2436,79 +2409,37 @@ class SimulationApp:
         pygame.draw.rect(self.screen, (239, 235, 225), world_rect)
         pygame.draw.rect(self.screen, TEXT_DARK, world_rect, width=2)
 
-        for x in self.instance.world.road_xs:
-            self._draw_vertical_road(x)
-        for y in self.instance.world.road_ys:
-            self._draw_horizontal_road(y)
+        road_xs = self.instance.world.road_xs
+        road_ys = self.instance.world.road_ys
+        for x in road_xs:
+            self._draw_road_segment((x, road_ys[0]), (x, road_ys[-1]))
+        for y in road_ys:
+            self._draw_road_segment((road_xs[0], y), (road_xs[-1], y))
+
+        # L-shaped depot road: vertical column from NE grid corner up to the
+        # horizontal arm, then horizontal arm.
+        grid_corner = (road_xs[-1], road_ys[-1])
+        vertical_top = (cad_layout.DEPOT_VERTICAL_X_IN, cad_layout.DEPOT_ARM_Y_IN)
+        arm_west_end = (cad_layout.DEPOT_ARM_XS[0], cad_layout.DEPOT_ARM_Y_IN)
+        self._draw_road_segment(grid_corner, vertical_top)
+        self._draw_road_segment(vertical_top, arm_west_end)
 
         self._draw_stations()
+        self._draw_depot_slots()
         self._draw_vehicles()
 
-    def _draw_vertical_road(self, x_in: float) -> None:
-        center_x, _ = self._to_screen((x_in, 0.0))
-        total_w = config.ROAD_ENVELOPE_WIDTH_IN * self.world_scale
-        road_y = self.world_top_px
-        road_h = self.world_height_px
-        left_x = center_x - (total_w / 2.0)
+    def _draw_road_segment(self, start_in: Coord, end_in: Coord) -> None:
+        start_px = self._to_screen(start_in)
+        end_px = self._to_screen(end_in)
+        width = max(2, int(round(config.ROAD_WIDTH_IN * self.world_scale)))
+        pygame.draw.line(self.screen, ROAD_STRIP, start_px, end_px, width=width)
 
-        pygame.draw.rect(self.screen, ROAD_STRIP, (left_x, road_y, total_w, road_h), border_radius=4)
-
-        divider_spans = [(0.0, config.WORLD_SIZE_IN)]
-        half_envelope = config.ROAD_ENVELOPE_WIDTH_IN / 2.0
-        for y_in in self.instance.world.road_ys:
-            divider_spans = subtract_span_list(
-                divider_spans,
-                max(0.0, y_in - half_envelope),
-                min(config.WORLD_SIZE_IN, y_in + half_envelope),
-            )
-
-        dash_len_px = config.LANE_DIVIDER_DASH_IN * self.world_scale
-        gap_len_px = config.LANE_DIVIDER_GAP_IN * self.world_scale
-        divider_width_px = max(1, int(round(config.LANE_DIVIDER_WIDTH_IN * self.world_scale)))
-        for start_y, end_y in divider_spans:
-            start_px = self._to_screen((x_in, start_y))
-            end_px = self._to_screen((x_in, end_y))
-            self._draw_dashed_line(
-                start_px,
-                end_px,
-                config.LANE_DIVIDER_COLOR,
-                dash_len_px,
-                gap_len_px,
-                divider_width_px,
-            )
-
-    def _draw_horizontal_road(self, y_in: float) -> None:
-        _, center_y = self._to_screen((0.0, y_in))
-        total_w = config.ROAD_ENVELOPE_WIDTH_IN * self.world_scale
-        road_x = self.world_left_px
-        road_w = self.world_width_px
-        top_y = center_y - (total_w / 2.0)
-
-        pygame.draw.rect(self.screen, ROAD_STRIP, (road_x, top_y, road_w, total_w), border_radius=4)
-
-        divider_spans = [(0.0, config.WORLD_SIZE_IN)]
-        half_envelope = config.ROAD_ENVELOPE_WIDTH_IN / 2.0
-        for x_in in self.instance.world.road_xs:
-            divider_spans = subtract_span_list(
-                divider_spans,
-                max(0.0, x_in - half_envelope),
-                min(config.WORLD_SIZE_IN, x_in + half_envelope),
-            )
-
-        dash_len_px = config.LANE_DIVIDER_DASH_IN * self.world_scale
-        gap_len_px = config.LANE_DIVIDER_GAP_IN * self.world_scale
-        divider_width_px = max(1, int(round(config.LANE_DIVIDER_WIDTH_IN * self.world_scale)))
-        for start_x, end_x in divider_spans:
-            start_px = self._to_screen((start_x, y_in))
-            end_px = self._to_screen((end_x, y_in))
-            self._draw_dashed_line(
-                start_px,
-                end_px,
-                config.LANE_DIVIDER_COLOR,
-                dash_len_px,
-                gap_len_px,
-                divider_width_px,
-            )
+    def _draw_depot_slots(self) -> None:
+        radius = max(3, int(round(config.ALVIK_SIZE_IN * self.world_scale * 0.35)))
+        for slot in self.instance.world.depot_slots:
+            x_px, y_px = self._to_screen(slot)
+            pygame.draw.circle(self.screen, DEPOT_BG, (int(x_px), int(y_px)), radius)
+            pygame.draw.circle(self.screen, DEPOT_EDGE, (int(x_px), int(y_px)), radius, width=1)
 
     def _draw_dashed_line(
         self,
@@ -2552,31 +2483,18 @@ class SimulationApp:
             progress += cycle_len
 
     def _draw_stations(self) -> None:
-        gap_px = self.instance.world.road_gap_in * self.world_scale
-        station_size = max(12, int(round(gap_px)) - 1)
+        # Stations sit at the 64 grid intersections in the new world. Drawn
+        # as small filled dots so they stay legible without blocking the
+        # roads they're embedded in.
+        radius = max(3, int(round(config.ALVIK_SIZE_IN * self.world_scale * 0.28)))
         active_ids = set(self.instance.active_job_ids)
-
         for station in self.instance.stations:
             state, color = self._station_state(station.station_id)
             if station.station_id not in active_ids:
-                state = "off"
                 color = STATION_INACTIVE
-
             x_px, y_px = self._to_screen(station.coord)
-            rect = pygame.Rect(0, 0, station_size, station_size)
-            rect.center = (x_px, y_px)
-            pygame.draw.rect(self.screen, color, rect, border_radius=4)
-            pygame.draw.rect(self.screen, ROAD_EDGE, rect, width=1, border_radius=4)
-
-            label_font = self._fit_font(station.name, station_size - 4, station_size - 4)
-            label = label_font.render(station.name, True, TEXT_DARK)
-            self.screen.blit(
-                label,
-                (
-                    rect.centerx - (label.get_width() / 2),
-                    rect.centery - (label.get_height() / 2),
-                ),
-            )
+            pygame.draw.circle(self.screen, color, (int(x_px), int(y_px)), radius)
+            pygame.draw.circle(self.screen, ROAD_EDGE, (int(x_px), int(y_px)), radius, width=1)
 
     def _draw_vehicles(self) -> None:
         alvik_px = config.ALVIK_SIZE_IN * self.world_scale
@@ -2730,7 +2648,7 @@ class SimulationApp:
 
     def _to_screen(self, coord: Coord) -> Tuple[float, float]:
         x_px = self.world_left_px + (coord[0] * self.world_scale)
-        y_px = self.world_top_px + ((config.WORLD_SIZE_IN - coord[1]) * self.world_scale)
+        y_px = self.world_top_px + ((config.WORLD_HEIGHT_IN - coord[1]) * self.world_scale)
         return x_px, y_px
 
     def _fit_font(self, text: str, max_width: int, max_height: int) -> pygame.font.Font:
