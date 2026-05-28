@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from vrp_rpd_sim import config
+from vrp_rpd_sim.mapf import MapfInfeasible, plan_space_time, validate as validate_schedule
 from vrp_rpd_sim.unity_export import export_unity_json
 from vrp_rpd_sim.solution_cache import solve_with_solution_cache
 from vrp_rpd_sim.world import build_instance
@@ -112,6 +113,18 @@ def main() -> None:
     if cache_path is not None:
         print(f"  Solution cache:   {'hit' if cache_hit else 'miss'} ({cache_path})")
 
+    try:
+        scheduled = plan_space_time(instance, solver, result.best, runtime_config.mapf)
+        validate_schedule(scheduled, clearance_sec=runtime_config.mapf.clearance_sec)
+    except MapfInfeasible as exc:
+        raise SystemExit(f"MAPF planner could not produce a collision-free schedule: {exc}") from exc
+
+    delta = scheduled.makespan - result.best.makespan
+    print(
+        f"  MAPF makespan:    {scheduled.makespan:.2f}s "
+        f"(+{delta:.2f}s vs solver, reason={scheduled.reason})"
+    )
+
     if args.export_unity_json:
         export_path = export_unity_json(
             args.export_unity_json,
@@ -139,6 +152,7 @@ def main() -> None:
         instance,
         solver,
         result,
+        scheduled=scheduled,
         sim_speed=runtime_config.app.sim_speed_multiplier,
         job_count=runtime_config.instance.active_job_count,
         processing_scale=runtime_config.instance.processing_time_scale,
@@ -146,6 +160,7 @@ def main() -> None:
         fullscreen=runtime_config.app.start_fullscreen,
         debug_depot=args.debug_depot,
         cache_config=runtime_config.cache,
+        mapf_config=runtime_config.mapf,
         record_unity_path=args.record_unity_json,
         record_capture_interval_sec=args.unity_capture_interval,
         auto_quit_on_complete=args.record_unity_json is not None,

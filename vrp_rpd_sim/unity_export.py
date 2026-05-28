@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from . import config
+from .mapf import MapfInfeasible, plan_space_time, validate as validate_schedule
 from .render import PALETTE, SimulationApp
 from .solution_cache import solve_with_solution_cache
 from .solver import SolverRunResult, VRPRPDSolver
@@ -31,10 +32,17 @@ def build_unity_export(
     solver = VRPRPDSolver(instance, solver_config=runtime_config.solver)
     result, _, _ = solve_with_solution_cache(solver, runtime_config.cache)
 
+    try:
+        scheduled = plan_space_time(instance, solver, result.best, runtime_config.mapf)
+        validate_schedule(scheduled, clearance_sec=runtime_config.mapf.clearance_sec)
+    except MapfInfeasible as exc:
+        raise RuntimeError(f"MAPF planner failed for export: {exc}") from exc
+
     app = SimulationApp(
         instance,
         solver,
         result,
+        scheduled=scheduled,
         sim_speed=runtime_config.app.sim_speed_multiplier,
         job_count=runtime_config.instance.active_job_count,
         processing_scale=runtime_config.instance.processing_time_scale,
@@ -42,6 +50,7 @@ def build_unity_export(
         fullscreen=False,
         debug_depot=debug_depot,
         cache_config=runtime_config.cache,
+        mapf_config=runtime_config.mapf,
         headless=True,
     )
 
@@ -96,7 +105,8 @@ def build_unity_export(
         "vehicleCount": instance.vehicle_count,
         "alvikSizeIn": config.ALVIK_SIZE_IN,
         "alvikSpeedInPerSec": instance.instance_config.alvik_speed_in_per_sec,
-        "plannedMakespanSec": result.best.makespan,
+        "plannedMakespanSec": scheduled.makespan,
+        "solverMakespanSec": result.best.makespan,
         "actualCompletionTimeSec": completion_time_sec,
         "captureIntervalSec": capture_interval_sec,
         "depot": _build_depot_data(instance),
@@ -181,7 +191,8 @@ def build_payload_from_recording(
         "vehicleCount": instance.vehicle_count,
         "alvikSizeIn": config.ALVIK_SIZE_IN,
         "alvikSpeedInPerSec": instance.instance_config.alvik_speed_in_per_sec,
-        "plannedMakespanSec": result.best.makespan,
+        "plannedMakespanSec": getattr(app, "scheduled", None).makespan if getattr(app, "scheduled", None) else result.best.makespan,
+        "solverMakespanSec": result.best.makespan,
         "actualCompletionTimeSec": completion_time_sec,
         "captureIntervalSec": capture_interval_sec,
         "depot": _build_depot_data(instance),

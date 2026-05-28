@@ -102,3 +102,40 @@ class EvaluatedSolution:
             if customer_id not in self.pickup_times and drop_time >= 0:
                 active += 1
         return active
+
+
+@dataclass(frozen=True)
+class NodeVisit:
+    """One time-stamped occupancy on the grid by a vehicle.
+
+    A vehicle is at `node_id` over the closed interval `[t_enter, t_exit]`.
+    Between consecutive visits the vehicle moves along the connecting edge
+    at constant speed. `is_service=True` marks a planned dwell at a
+    customer node (drop or pickup) or the depot return.
+    """
+
+    node_id: str
+    t_enter: float
+    t_exit: float
+    is_service: bool = False
+    customer_id: int | None = None
+    op_kind: str | None = None  # "D", "P", or None
+
+
+@dataclass
+class ScheduledSolution:
+    """Per-vehicle collision-free space-time schedule.
+
+    Produced by the MAPF post-processing stage from an EvaluatedSolution.
+    `base` is the original solver output (kept untouched). `paths[vid]` is
+    the sequence of grid-level NodeVisits for vehicle `vid` from depot
+    departure through depot return. `return_times` is the MAPF-adjusted
+    per-vehicle finish time (>= base.return_times[vid] for every v).
+    """
+
+    base: EvaluatedSolution
+    paths: Dict[int, List[NodeVisit]]
+    return_times: Dict[int, float]
+    makespan: float
+    priority_order: List[int]
+    reason: str = "ok"

@@ -242,6 +242,62 @@ class AppConfig:
 
 
 @dataclass(frozen=True)
+class MapfConfig:
+    """Settings for the offline MAPF (Multi-Agent Path Finding) stage that
+    rewrites the solver's routes into a collision-free space-time schedule.
+
+    Priority order: slowest agent (largest VRP `return_time`) plans first
+    on its solver-derived Dijkstra path; subsequent agents space-time A*
+    against a reservation table, waiting or detouring as needed.
+    """
+
+    enabled: bool = True
+    # Time gap between two vehicles' uses of a shared node/edge. Must
+    # be at least body_diameter * sqrt(2) / speed so two vehicles
+    # approaching the same intersection from perpendicular edges don't
+    # have their 3.78" bodies overlap at the intersection corner.
+    # 3.78 * sqrt(2) / 5.12 ≈ 1.04s; bump slightly for safety margin.
+    clearance_sec: float = 1.1
+    # Cap A* search horizon as a multiple of the solver's makespan.
+    max_horizon_multiplier: float = 8.0
+    # Time the L-shaped depot corridor blocks the depot mouth on entry/exit.
+    # The MAPF planner reserves the depot vertex for this interval before a
+    # vehicle's grid trip starts and after it ends so two vehicles never
+    # share the corridor. Must be >= the longest actual corridor walk so
+    # the physical traversal fits inside the reservation. Deepest slot
+    # (slot 9, distance 36in) needs 36/5.118 ≈ 7.03s; round up for safety.
+    corridor_traverse_sec: float = 7.5
+    # Fallback chain when a lower-priority agent has no space-time path.
+    fallback_delay_initial_sec: float = 5.0
+    fallback_delay_growth: float = 1.8
+    fallback_max_delay_attempts: int = 5
+    fallback_max_swap_attempts: int = 8
+    # Stage-3 fallback: if both delay and pairwise swap exhaust, retry
+    # the entire plan with ascending-route-length priority order.
+    # Disabled by default because depot slot assignment is coupled to
+    # makespan-descending order — any alternate priority leaves the slot-0
+    # vehicle (parked at the depot mouth) NOT planned first, which causes
+    # corridor collisions.
+    fallback_allow_reverse_priority: bool = False
+
+    def __post_init__(self) -> None:
+        if self.clearance_sec < 0:
+            raise ValueError("clearance_sec must be non-negative.")
+        if self.max_horizon_multiplier <= 0:
+            raise ValueError("max_horizon_multiplier must be positive.")
+        if self.corridor_traverse_sec < 0:
+            raise ValueError("corridor_traverse_sec must be non-negative.")
+        if self.fallback_delay_initial_sec < 0:
+            raise ValueError("fallback_delay_initial_sec must be non-negative.")
+        if self.fallback_delay_growth <= 0:
+            raise ValueError("fallback_delay_growth must be positive.")
+        if self.fallback_max_delay_attempts < 0:
+            raise ValueError("fallback_max_delay_attempts must be non-negative.")
+        if self.fallback_max_swap_attempts < 0:
+            raise ValueError("fallback_max_swap_attempts must be non-negative.")
+
+
+@dataclass(frozen=True)
 class CacheConfig:
     enabled: bool = True
     directory: str = DEFAULT_SOLUTION_CACHE_DIR
@@ -261,6 +317,7 @@ class RuntimeConfig:
     solver: SolverConfig = field(default_factory=SolverConfig)
     app: AppConfig = field(default_factory=AppConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    mapf: MapfConfig = field(default_factory=MapfConfig)
 
 
 def default_runtime_config() -> RuntimeConfig:
@@ -283,6 +340,7 @@ def load_runtime_config(path: str | Path | None = None) -> RuntimeConfig:
         solver=_load_dataclass(SolverConfig, defaults.solver, raw.get("solver")),
         app=_load_dataclass(AppConfig, defaults.app, raw.get("app")),
         cache=_load_dataclass(CacheConfig, defaults.cache, raw.get("cache")),
+        mapf=_load_dataclass(MapfConfig, defaults.mapf, raw.get("mapf")),
     )
 
 

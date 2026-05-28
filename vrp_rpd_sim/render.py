@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Set, Tuple
 
 import pygame
 
 from . import cad_layout, config
-from .model import Instance, Operation
+from .mapf import MapfInfeasible, plan_space_time, validate as validate_schedule
+from .model import Instance, NodeVisit, Operation, ScheduledSolution
 from .solution_cache import solve_with_solution_cache
 from .solver import SolverRunResult, VRPRPDSolver, orthogonalize_points
 from .world import build_instance
@@ -88,10 +89,24 @@ class VehicleState:
     depot_entry: Coord | None = None
     depot_corridor: str | None = None
     departure_release_time: float = 0.0
-    # When > 0, the vehicle reverses along its path at normal speed for this
-    # many substeps. Set by the deadlock breaker so the retreat is smooth
-    # instead of an instant teleport, and so multiple vehicles don't all
-    # decide to retreat in the same substep.
+    # MAPF-driven space-time schedule. `schedule_index` points at the current
+    # NodeVisit; the vehicle dwells at `schedule[schedule_index].node_id`
+    # until `t_exit` then transitions to `schedule[schedule_index+1]`.
+    schedule: List[NodeVisit] = field(default_factory=list)
+    schedule_index: int = 0
+    # Track which special transitions have been built. The first
+    # transition is home_slot -> depot (L-corridor egress); the last is
+    # depot -> home_slot (L-corridor ingress).
+    egress_built: bool = False
+    ingress_built: bool = False
+    # When an active_path is set, record sim_time at start and the planned
+    # arrival sim_time at end. _advance_vehicles uses these to interpolate
+    # position directly from sim_time rather than integrating step-by-step,
+    # so MAPF schedule times are honored exactly (no quantization drift).
+    path_start_time: float = 0.0
+    path_arrival_time: float = 0.0
+    # Unused after MAPF integration; retained so downstream visualization
+    # (currently dead code) compiles.
     yield_reverse_substeps_remaining: int = 0
 
     def load_marker(self) -> int:
@@ -115,6 +130,7 @@ class SimulationApp:
         solver: VRPRPDSolver,
         result: SolverRunResult,
         *,
+        scheduled: ScheduledSolution | None = None,
         sim_speed: float | None = None,
         job_count: int | None = None,
         processing_scale: float | None = None,
@@ -122,6 +138,7 @@ class SimulationApp:
         fullscreen: bool | None = None,
         debug_depot: bool = False,
         cache_config: config.CacheConfig | None = None,
+        mapf_config: config.MapfConfig | None = None,
         headless: bool = False,
         record_unity_path: str | None = None,
         record_capture_interval_sec: float = 0.1,
@@ -137,8 +154,13 @@ class SimulationApp:
         self.instance_config = instance.instance_config
         self.solver_config = solver.solver_config
         self.cache_config = cache_config or config.default_runtime_config().cache
+        self.mapf_config = mapf_config or config.default_runtime_config().mapf
         self.result = result
         self.solution = result.best
+        if scheduled is None:
+            scheduled = plan_space_time(instance, solver, result.best, self.mapf_config)
+            validate_schedule(scheduled, clearance_sec=self.mapf_config.clearance_sec)
+        self.scheduled = scheduled
 
         self.fixed_processing_time = (
             fixed_processing_time
@@ -364,6 +386,14 @@ class SimulationApp:
         self.solver = VRPRPDSolver(self.instance, solver_config=self.solver_config)
         self.result, _, _ = solve_with_solution_cache(self.solver, self.cache_config)
         self.solution = self.result.best
+        try:
+            self.scheduled = plan_space_time(
+                self.instance, self.solver, self.solution, self.mapf_config
+            )
+            validate_schedule(self.scheduled, clearance_sec=self.mapf_config.clearance_sec)
+        except MapfInfeasible as exc:
+            self.status_message = f"{message}. MAPF infeasible: {exc}"
+            return
         self._reset_simulation()
         self.status_message = message
 
@@ -447,9 +477,17 @@ class SimulationApp:
             self.instance.world.depot_slots,
             key=lambda slot: (euclidean(slot, depot_access), -slot[1], -slot[0]),
         )
-        active_vehicle_ids = [
-            vehicle_id for vehicle_id, route in enumerate(self.solution.routes) if route
-        ]
+        # Slot 0 is the depot mouth (== i_7_7), so the vehicle parked there
+        # physically blocks the corridor entrance. To make MAPF's
+        # slowest-first priority order line up with the FIFO egress that
+        # the L-corridor topology requires, assign slots in the same order:
+        # slot 0 = slowest route (planned first by MAPF, leaves the mouth
+        # first), slot 9 = fastest route (planned last, returns first).
+        return_times = self.solution.return_times
+        active_vehicle_ids = sorted(
+            [vid for vid, route in enumerate(self.solution.routes) if route],
+            key=lambda v: (-return_times[v], v),
+        )
         idle_vehicle_ids = [
             vehicle_id for vehicle_id, route in enumerate(self.solution.routes) if not route
         ]
@@ -457,6 +495,13 @@ class SimulationApp:
             vehicle_id: ordered_slots[index]
             for index, vehicle_id in enumerate(active_vehicle_ids + idle_vehicle_ids)
         }
+        # Dynamic ingress slot assignment: first vehicle to return parks at
+        # the deepest active slot, second at the next-deepest, etc. This
+        # guarantees parked vehicles never sit in a later-arriving vehicle's
+        # corridor walk path. The original home_slot only determines the
+        # EGRESS starting point; ingress is reassigned chronologically.
+        active_slots = ordered_slots[:len(active_vehicle_ids)]
+        self.ingress_slot_queue = list(reversed(active_slots))
 
         vehicles = []
         launch_order = {
@@ -465,9 +510,9 @@ class SimulationApp:
         for vehicle_id in range(self.instance.vehicle_count):
             home_slot = slot_by_vehicle[vehicle_id]
             route = list(self.solution.routes[vehicle_id])
-            return_slot_index = None
-            if not route:
-                return_slot_index = self.depot_return_slot_ranks[home_slot]
+            schedule = list(self.scheduled.paths.get(vehicle_id, []))
+            return_slot_index = self.depot_return_slot_ranks.get(home_slot)
+            if return_slot_index is not None:
                 self.reserved_return_slots.add(home_slot)
             vehicles.append(
                 VehicleState(
@@ -482,6 +527,11 @@ class SimulationApp:
                     departure_release_time=(
                         launch_order.get(vehicle_id, 0) * DEPARTURE_STAGGER_SECONDS
                     ),
+                    schedule=schedule,
+                    schedule_index=0,
+                    egress_built=False,
+                    ingress_built=False,
+                    completed=not schedule,
                 )
             )
         return vehicles
@@ -745,6 +795,7 @@ class SimulationApp:
             self._prime_vehicle_targets()
             self._advance_vehicles(step)
             self._resolve_arrivals()
+            self._assert_no_physical_collisions()
             self._check_vehicle_stuck()
             remaining -= step
 
@@ -771,14 +822,19 @@ class SimulationApp:
                     self._clear_stuck_state(vid)
                     continue
 
-            # Pre-departure stagger: also a legitimate wait.
-            if (
-                vehicle.route_index == 0
-                and vehicle.current_node == self.instance.depot_node
-                and self.sim_time < vehicle.departure_release_time
-            ):
-                self._clear_stuck_state(vid)
-                continue
+            # MAPF-planned wait: vehicle is sitting at home_slot before its
+            # corridor egress window, or holding at a scheduled NodeVisit
+            # dwell. Not a deadlock.
+            if vehicle.schedule:
+                idx = vehicle.schedule_index
+                if 0 <= idx < len(vehicle.schedule):
+                    current_visit = vehicle.schedule[idx]
+                    if self.sim_time + 1e-9 < current_visit.t_exit:
+                        self._clear_stuck_state(vid)
+                        continue
+                if idx == 0 and not vehicle.egress_built:
+                    self._clear_stuck_state(vid)
+                    continue
 
             signal = self._vehicle_progress_signal(vehicle)
             previous = self.last_progress_signal.get(vid) if hasattr(self, "last_progress_signal") else None
@@ -883,309 +939,212 @@ class SimulationApp:
             )
 
     def _prime_vehicle_targets(self) -> None:
-        self._assign_return_targets()
+        """Build the next polyline for each vehicle from its MAPF schedule.
+
+        Each vehicle follows a list of NodeVisits produced by the offline
+        MAPF planner. The first visit is the depot-egress window (vehicle
+        walks the L-corridor from its home slot to the depot mouth). The
+        last visit is the depot-ingress window (depot mouth to home
+        slot). Intermediate visits are grid intersections; transitions
+        between them are single-edge polylines traversed at constant
+        speed.
+        """
+        speed = self.instance.instance_config.alvik_speed_in_per_sec
+        depot_node = self.instance.depot_node
         for vehicle in self.vehicles:
-            if vehicle.completed:
+            if vehicle.completed or vehicle.active_path is not None:
                 continue
-
-            if vehicle.waiting_customer_id is not None:
-                station_state = self.station_progress[vehicle.waiting_customer_id]
-                ready_at = station_state["ready_at"]
-                if ready_at is not None and self.sim_time >= ready_at:
-                    station_state["picked_at"] = self.sim_time
-                    vehicle.load = min(self.instance.capacity, vehicle.load + 1)
-                    vehicle.waiting_customer_id = None
-                    vehicle.route_index += 1
-                else:
-                    continue
-
-            if vehicle.active_path is not None:
-                continue
-
-            if vehicle.route_index < len(vehicle.route):
-                if (
-                    vehicle.route_index == 0
-                    and vehicle.current_node == self.instance.depot_node
-                    and self.sim_time < vehicle.departure_release_time
-                ):
-                    continue
-                if (
-                    vehicle.route_index == 0
-                    and vehicle.current_node == self.instance.depot_node
-                    and self._depot_departure_control_zone_occupied(exclude_vehicle_id=vehicle.vehicle_id)
-                ):
-                    continue
-                op = vehicle.route[vehicle.route_index]
-                target_node = self.solver.customer_node(op.customer_id)
-                vehicle.target_node = target_node
-                points = self._travel_points(vehicle.position, vehicle.current_node, target_node, False)
-                vehicle.active_path = build_path_state(points)
-                if vehicle.active_path is None:
-                    self._handle_arrival(vehicle)
-                continue
-
-            # Track the moment a vehicle becomes homebound (route exhausted).
-            if vehicle.vehicle_id not in self.homebound_since:
-                self.homebound_since[vehicle.vehicle_id] = self.sim_time
-                self._debug_depot_message(
-                    f"V{vehicle.vehicle_id + 1} entered homebound at "
-                    f"{vehicle.current_node} pos={tuple(round(v, 2) for v in vehicle.position)}"
-                )
-
-            if vehicle.return_slot_index is None:
-                self._assign_return_targets()
-            if vehicle.return_slot_index is None:
-                continue
-            if (
-                vehicle.current_node != self.instance.depot_node
-                or euclidean(vehicle.position, vehicle.home_slot) > 1e-6
-            ):
-                vehicle.target_node = self.instance.depot_node
-                if vehicle.current_node != self.instance.depot_node:
-                    points = self._travel_points(
-                        vehicle.position,
-                        vehicle.current_node,
-                        self.instance.depot_node,
-                        True,
-                        home_slot=vehicle.home_slot,
-                        depot_entry=vehicle.depot_entry,
-                        depot_corridor=vehicle.depot_corridor,
-                    )
-                else:
-                    points = self._depot_parking_points(vehicle.position, vehicle.home_slot)
-                vehicle.active_path = build_path_state(points)
-                self._debug_depot_message(
-                    f"V{vehicle.vehicle_id + 1} return path built: "
-                    f"{len(points)} pts, length={polyline_length(points):.2f}, "
-                    f"corridor={vehicle.depot_corridor}, slot={tuple(round(v, 2) for v in vehicle.home_slot)}, "
-                    f"start={tuple(round(v, 2) for v in vehicle.position)}, "
-                    f"end={tuple(round(v, 2) for v in points[-1]) if points else None}"
-                )
-                if vehicle.active_path is None:
-                    if euclidean(vehicle.position, vehicle.home_slot) <= 1e-6:
-                        vehicle.completed = True
-                        vehicle.completion_time = self.sim_time
-                        self._debug_depot_message(
-                            f"V{vehicle.vehicle_id + 1} completed (degenerate path) at home_slot"
-                        )
-                    else:
-                        # Path is empty/degenerate but vehicle isn't at its home_slot:
-                        # this is the bug surface where a vehicle gets stuck silently.
-                        self._warn_depot_message(
-                            f"V{vehicle.vehicle_id + 1} got empty return path while "
-                            f"pos={tuple(round(v, 2) for v in vehicle.position)} != "
-                            f"home_slot={tuple(round(v, 2) for v in vehicle.home_slot)} "
-                            f"(current_node={vehicle.current_node}, corridor={vehicle.depot_corridor})"
-                        )
-            else:
+            if not vehicle.schedule:
                 vehicle.completed = True
                 vehicle.completion_time = self.sim_time
-                self._debug_depot_message(
-                    f"V{vehicle.vehicle_id + 1} completed return at slot "
-                    f"{tuple(round(v, 2) for v in vehicle.home_slot)}"
-                )
+                continue
+
+            idx = vehicle.schedule_index
+            if idx >= len(vehicle.schedule):
+                if euclidean(vehicle.position, vehicle.home_slot) <= 1e-6:
+                    vehicle.completed = True
+                    vehicle.completion_time = self.sim_time
+                continue
+
+            current = vehicle.schedule[idx]
+
+            # Phase 1: depot egress (first visit). Vehicle starts at home_slot.
+            if idx == 0 and not vehicle.egress_built:
+                corridor_distance = self._corridor_distance(vehicle.home_slot)
+                actual_corridor_time = corridor_distance / speed if speed > 0 else 0.0
+                t_start_move = current.t_exit - actual_corridor_time
+                if self.sim_time + 1e-9 < t_start_move:
+                    continue  # still parked, waiting for egress window
+                points = self._egress_polyline(vehicle.home_slot)
+                vehicle.active_path = build_path_state(points)
+                vehicle.target_node = depot_node
+                vehicle.egress_built = True
+                vehicle.path_start_time = t_start_move
+                vehicle.path_arrival_time = current.t_exit
+                if vehicle.active_path is None:
+                    vehicle.position = self.instance.world.coords[depot_node]
+                    vehicle.current_node = depot_node
+                continue
+
+            # Phase 3: depot ingress (last visit). Vehicle starts at depot.
+            if idx == len(vehicle.schedule) - 1 and not vehicle.ingress_built:
+                # Dynamic slot assignment: take the deepest still-available
+                # slot. Order of arrival at the mouth determines parking
+                # depth, so the corridor never has to be walked past a
+                # parked Alvik.
+                if self.ingress_slot_queue:
+                    vehicle.home_slot = self.ingress_slot_queue.pop(0)
+                corridor_distance = self._corridor_distance(vehicle.home_slot)
+                actual_corridor_time = corridor_distance / speed if speed > 0 else 0.0
+                points = self._ingress_polyline(vehicle.home_slot)
+                vehicle.active_path = build_path_state(points)
+                vehicle.target_node = depot_node
+                vehicle.ingress_built = True
+                vehicle.path_start_time = self.sim_time
+                vehicle.path_arrival_time = self.sim_time + actual_corridor_time
+                if vehicle.active_path is None:
+                    vehicle.position = vehicle.home_slot
+                    vehicle.completed = True
+                    vehicle.completion_time = self.sim_time
+                continue
+
+            # Phase 2: mid-grid. Dwell until t_exit then traverse to next visit.
+            if self.sim_time + 1e-9 < current.t_exit:
+                # Pickup safety net: extra wait if station isn't ready yet
+                # (MAPF assumed solver wait_time; reality may be later).
+                if current.is_service and current.op_kind == "P" and current.customer_id is not None:
+                    ready_at = self.station_progress.get(current.customer_id, {}).get("ready_at")
+                    if ready_at is not None and self.sim_time < ready_at:
+                        continue
+                continue
+
+            if idx + 1 >= len(vehicle.schedule):
+                # End of schedule reached without ingress (idle/degenerate).
+                vehicle.completed = True
+                vehicle.completion_time = self.sim_time
+                continue
+
+            next_visit = vehicle.schedule[idx + 1]
+            # Exit-effect for pickups completed at this visit.
+            if current.is_service and current.op_kind == "P" and current.customer_id is not None:
+                station_state = self.station_progress.get(current.customer_id)
+                if station_state is not None and station_state.get("picked_at") is None:
+                    station_state["picked_at"] = self.sim_time
+                    vehicle.load = min(self.instance.capacity, vehicle.load + 1)
+                    vehicle.route_index += 1
+                vehicle.waiting_customer_id = None
+
+            cur_coord = self.instance.world.coords[current.node_id]
+            nxt_coord = self.instance.world.coords[next_visit.node_id]
+            if euclidean(cur_coord, nxt_coord) <= 1e-6:
+                # Zero-distance transition (e.g., depot ↔ i_7_7).
+                vehicle.schedule_index += 1
+                vehicle.current_node = next_visit.node_id
+                vehicle.position = nxt_coord
+                self._handle_visit_entry(vehicle, vehicle.schedule_index)
+                continue
+
+            points = dedupe_points([cur_coord, nxt_coord])
+            vehicle.active_path = build_path_state(points)
+            vehicle.target_node = next_visit.node_id
+            # Pin traversal timing to MAPF schedule: vehicle leaves at
+            # current.t_exit and arrives at next_visit.t_enter exactly,
+            # so _advance_vehicles interpolates without integration drift.
+            vehicle.path_start_time = current.t_exit
+            vehicle.path_arrival_time = next_visit.t_enter
+
+    def _corridor_distance(self, home_slot: Coord) -> float:
+        depot_access = self.instance.world.coords[self.instance.depot_node]
+        if euclidean(home_slot, depot_access) <= 1e-6:
+            return 0.0
+        # _l_path omits the leading start point, so prepend depot_access
+        # to capture the depot→corner leg as well as corner→slot.
+        return polyline_length([depot_access, *self._l_path(depot_access, home_slot)])
+
+    def _egress_polyline(self, home_slot: Coord) -> List[Coord]:
+        depot_access = self.instance.world.coords[self.instance.depot_node]
+        if euclidean(home_slot, depot_access) <= 1e-6:
+            return [depot_access]
+        return dedupe_points([home_slot, *self._l_path(home_slot, depot_access)])
+
+    def _ingress_polyline(self, home_slot: Coord) -> List[Coord]:
+        depot_access = self.instance.world.coords[self.instance.depot_node]
+        if euclidean(home_slot, depot_access) <= 1e-6:
+            return [home_slot]
+        return dedupe_points([depot_access, *self._l_path(depot_access, home_slot)])
+
+    def _handle_visit_entry(self, vehicle: VehicleState, idx: int) -> None:
+        """Apply station/load side-effects when entering a service visit."""
+        if idx >= len(vehicle.schedule):
+            return
+        visit = vehicle.schedule[idx]
+        if not visit.is_service or visit.customer_id is None:
+            return
+        station_state = self.station_progress.get(visit.customer_id)
+        if station_state is None:
+            return
+        if visit.op_kind == "D":
+            station_state["dropped_at"] = self.sim_time
+            station_state["ready_at"] = (
+                self.sim_time + self.instance.processing_times[visit.customer_id]
+            )
+            vehicle.load = max(0, vehicle.load - 1)
+            vehicle.route_index += 1
+        elif visit.op_kind == "P":
+            # Mark waiting; the actual pickup completes when the vehicle
+            # leaves this visit (see exit-effect in _prime_vehicle_targets).
+            vehicle.waiting_customer_id = visit.customer_id
 
     def _advance_vehicles(self, step: float) -> None:
-        max_distance = self.instance.instance_config.alvik_speed_in_per_sec * step
-        current_owners = self._current_resource_owners()
-        current_positions = {
-            vehicle.vehicle_id: vehicle.position
-            for vehicle in self.vehicles
-        }
-        movable = [
-            vehicle
-            for vehicle in self.vehicles
-            if not vehicle.completed and vehicle.waiting_customer_id is None and vehicle.active_path is not None
-        ]
-        intersection_winners = self._intersection_winners(movable, max_distance, current_owners)
+        """Schedule-pinned position update along the MAPF polyline.
 
-        # Vehicles in scheduled-reverse mode move *backward* one substep's
-        # worth, then the counter is decremented. Done before the forward
-        # candidate logic so reversers don't compete for forward resources.
-        for vehicle in movable:
-            if vehicle.yield_reverse_substeps_remaining <= 0:
+        Position is computed from sim_time and the path's planned start/
+        arrival times rather than by integrating velocity*dt. This
+        eliminates sim_step quantization drift — at any sim_time t the
+        vehicle is at exactly the position MAPF expects it at t, so
+        zero-collision guarantees from the planner translate directly
+        to zero physical collisions at runtime.
+        """
+        for vehicle in self.vehicles:
+            if vehicle.completed or vehicle.active_path is None:
                 continue
             path = vehicle.active_path
-            if path is None or path.distance <= 1e-6:
-                vehicle.yield_reverse_substeps_remaining = 0
-                continue
-            new_distance = max(0.0, path.distance - max_distance)
-            path.distance = new_distance
+            t_start = vehicle.path_start_time
+            t_arrival = vehicle.path_arrival_time
+            duration = t_arrival - t_start
+            if duration <= 1e-9:
+                fraction = 1.0
+            else:
+                fraction = (self.sim_time - t_start) / duration
+                fraction = max(0.0, min(1.0, fraction))
+            path.distance = fraction * path.total_length
             vehicle.position = path.position()
-            vehicle.yield_reverse_substeps_remaining -= 1
-            self.blocked_counts[vehicle.vehicle_id] = 0
-        # Refresh ownership/position state since reversers just moved.
-        current_owners = self._current_resource_owners()
-        current_positions = {
-            vehicle.vehicle_id: vehicle.position
-            for vehicle in self.vehicles
-        }
 
-        candidates: Dict[int, MovementCandidate] = {}
-        for vehicle in movable:
-            if vehicle.yield_reverse_substeps_remaining > 0:
-                # Reversers don't try to advance forward this substep.
-                continue
-            path = vehicle.active_path
-            if path is None:
-                continue
-            if path.total_length - path.distance <= 1e-5:
-                path.distance = path.total_length
-                vehicle.position = path.position()
-                self.blocked_counts[vehicle.vehicle_id] = 0
-                continue
-            travel = min(max_distance, path.total_length - path.distance)
-            if travel <= 0:
-                continue
+    def _assert_no_physical_collisions(self) -> None:
+        """Hard tripwire: any two active Alviks within a body-diameter
+        of each other is a planner bug (model gap between the MAPF graph
+        and physical layout). Halt the sim with diagnostics rather than
+        silently rendering vehicles driving through each other.
 
-            start_distance = path.distance
-            allowed = self._max_resource_safe_travel(
-                vehicle,
-                travel,
-                current_owners,
-                intersection_winners,
-            )
-            # Predictive yield: simulate where this vehicle and every
-            # higher-priority vehicle will be over the next ~1.5 sim-seconds.
-            # If a future-clearance violation is predicted, shrink `allowed`
-            # so this vehicle yields well before the conflict zone instead of
-            # advancing into a deadlock that needs force-reverse to escape.
-            if allowed > 1e-6:
-                allowed = self._lookahead_yield_travel(
-                    vehicle,
-                    allowed,
-                    max_distance,
-                )
-            if allowed <= 1e-6:
-                self._record_pause(vehicle.vehicle_id)
-                continue
-
-            end_distance = start_distance + allowed
-            candidates[vehicle.vehicle_id] = MovementCandidate(
-                vehicle=vehicle,
-                start_distance=start_distance,
-                end_distance=end_distance,
-                start_position=path.position_at(start_distance),
-                end_position=path.position_at(end_distance),
-                resources=self._resources_for_path_range(path, start_distance, end_distance),
-            )
-
-        safe_candidates = self._clearance_safe_candidates(candidates, current_positions)
-        accepted_ids = self._select_movement_winners(
-            safe_candidates,
-            max_distance,
-            current_owners,
-            current_positions,
-        )
-        accepted_ids = self._filter_clearance_safe_acceptances(
-            safe_candidates,
-            current_positions,
-            accepted_ids,
-        )
-        backoff_candidate = None
-        rejected_ids = set(candidates) - accepted_ids
-        if rejected_ids:
-            backoff_candidate = self._select_backoff_candidate(
-                [
-                    vehicle
-                    for vehicle in movable
-                    if vehicle.vehicle_id in rejected_ids
-                ],
-                max_distance,
-                current_owners,
-                current_positions,
-            )
-            if backoff_candidate is not None and not self._candidate_clear_against_accepted_movements(
-                backoff_candidate,
-                safe_candidates,
-                accepted_ids,
-            ):
-                backoff_candidate = None
-        if not accepted_ids:
-            if backoff_candidate is not None:
-                path = backoff_candidate.vehicle.active_path
-                if path is not None:
-                    path.distance = backoff_candidate.end_distance
-                    backoff_candidate.vehicle.position = path.position()
-                    self.blocked_counts[backoff_candidate.vehicle.vehicle_id] = 0
-                    self.blocked_substeps = 0
-                return
-
-        for candidate in safe_candidates.values():
-            vehicle_id = candidate.vehicle.vehicle_id
-            if vehicle_id not in accepted_ids:
-                self._record_pause(vehicle_id)
-                continue
-            path = candidate.vehicle.active_path
-            if path is None:
-                continue
-            path.distance = candidate.end_distance
-            candidate.vehicle.position = path.position()
-            self.blocked_counts[vehicle_id] = 0
-
-        backoff_vehicle_id = None
-        if backoff_candidate is not None and accepted_ids:
-            path = backoff_candidate.vehicle.active_path
-            if path is not None:
-                backoff_vehicle_id = backoff_candidate.vehicle.vehicle_id
-                path.distance = backoff_candidate.end_distance
-                backoff_candidate.vehicle.position = path.position()
-                self.blocked_counts[backoff_vehicle_id] = 0
-
-        blocked_candidate_ids = set(candidates) - set(safe_candidates)
-        for vehicle_id in blocked_candidate_ids:
-            if vehicle_id == backoff_vehicle_id:
-                continue
-            self._record_pause(vehicle_id)
-
-        moved_count = len(accepted_ids) + (1 if backoff_vehicle_id is not None else 0)
-        if movable and moved_count == 0:
-            self.blocked_substeps += 1
-            if self.blocked_substeps >= 50:
-                self.status_message = "Traffic blocked: no clearance-safe move available"
-        else:
-            self.blocked_substeps = 0
-
-        # Per-vehicle deadlock recovery: track the maximum path.distance each
-        # vehicle has ever reached. If a vehicle's path hasn't grown past its
-        # high-water mark for `stagnation_threshold` sim-seconds, it's wedged
-        # (possibly oscillating in tiny back-forth motions which would reset
-        # blocked_count). Force-reverse the cluster around the most-stagnant
-        # vehicle. Re-checked each substep so it triggers once per stall, and
-        # the high-water mark advances whenever real progress resumes.
-        stagnation_threshold = 0.5
-        most_stagnant: VehicleState | None = None
-        most_stalled = 0.0
-        for vehicle in movable:
-            path = vehicle.active_path
-            if path is None:
-                continue
-            vid = vehicle.vehicle_id
-            high = self._max_path_distance.get(vid, -1.0)
-            if path.distance > high + 1e-6:
-                self._max_path_distance[vid] = path.distance
-                self._max_path_time[vid] = self.sim_time
-                continue
-            stalled = self.sim_time - self._max_path_time.get(vid, self.sim_time)
-            if stalled > most_stalled:
-                most_stalled = stalled
-                most_stagnant = vehicle
-        if most_stagnant is not None and most_stalled >= stagnation_threshold:
-            if self._force_cluster_reverse(
-                movable,
-                max_distance,
-                current_owners,
-                current_positions,
-                anchor=most_stagnant,
-            ):
-                # Reverses move path.distance backward — re-arm the watermark
-                # so we don't immediately re-trigger.
-                for vehicle in movable:
-                    if vehicle.active_path is not None:
-                        self._max_path_distance[vehicle.vehicle_id] = vehicle.active_path.distance
-                        self._max_path_time[vehicle.vehicle_id] = self.sim_time
-            if self.status_message.startswith("Traffic blocked"):
-                self.status_message = ""
+        Center-to-center distance >= ALVIK_SIZE_IN guarantees the square
+        footprints don't overlap, which is the zero-collision contract.
+        """
+        min_sep = config.ALVIK_SIZE_IN
+        active = [v for v in self.vehicles if not v.completed]
+        for i, va in enumerate(active):
+            for vb in active[i + 1:]:
+                dx = va.position[0] - vb.position[0]
+                dy = va.position[1] - vb.position[1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist + 1e-6 < min_sep:
+                    raise RuntimeError(
+                        f"COLLISION at sim_time={self.sim_time:.3f}s: "
+                        f"V{va.vehicle_id} and V{vb.vehicle_id} are "
+                        f"{dist:.2f}in apart (min {min_sep:.2f}in). "
+                        f"V{va.vehicle_id}@{tuple(round(c, 2) for c in va.position)}, "
+                        f"V{vb.vehicle_id}@{tuple(round(c, 2) for c in vb.position)}. "
+                        f"MAPF schedule has a model gap — investigate."
+                    )
 
     def _lookahead_yield_travel(
         self,
@@ -2214,52 +2173,68 @@ class SimulationApp:
         return on_column or on_arm
 
     def _resolve_arrivals(self) -> None:
+        """Advance schedule_index for vehicles that finished their polyline.
+
+        Vehicles fall into three completion cases:
+        - Just finished the depot egress (idx == 0): now at depot mouth;
+          advance schedule_index to land on the first grid visit.
+        - Just finished the depot ingress (idx == len-1): now at home
+          slot; mark vehicle completed.
+        - Just finished a normal grid-edge polyline: advance to the
+          next NodeVisit and apply any entry-side service effects.
+        """
+        depot_node = self.instance.depot_node
         for vehicle in self.vehicles:
-            if vehicle.active_path is None or vehicle.completed:
+            if vehicle.completed or vehicle.active_path is None:
                 continue
-            if vehicle.active_path.distance + 1e-5 < vehicle.active_path.total_length:
+            path = vehicle.active_path
+            if path.distance + 1e-5 < path.total_length:
                 continue
-            self._handle_arrival(vehicle)
 
-    def _handle_arrival(self, vehicle: VehicleState) -> None:
-        target_node = vehicle.target_node
-        vehicle.active_path = None
-        if target_node is None:
-            return
+            vehicle.active_path = None
+            idx = vehicle.schedule_index
 
-        vehicle.current_node = target_node
-        if vehicle.route_index >= len(vehicle.route):
-            vehicle.target_node = None
-            if euclidean(vehicle.position, vehicle.home_slot) <= 1e-6:
+            if not vehicle.schedule:
                 vehicle.completed = True
                 vehicle.completion_time = self.sim_time
-            return
+                continue
 
-        op = vehicle.route[vehicle.route_index]
-        if target_node != self.solver.customer_node(op.customer_id):
-            vehicle.target_node = None
-            return
+            if idx == 0 and vehicle.egress_built:
+                # Arrived at depot mouth after L-corridor walk.
+                vehicle.position = self.instance.world.coords[depot_node]
+                vehicle.current_node = depot_node
+                vehicle.schedule_index = min(idx + 1, len(vehicle.schedule) - 1)
+                next_visit = vehicle.schedule[vehicle.schedule_index]
+                vehicle.position = self.instance.world.coords[next_visit.node_id]
+                vehicle.current_node = next_visit.node_id
+                self._handle_visit_entry(vehicle, vehicle.schedule_index)
+                continue
 
-        if op.kind == "D":
-            station_state = self.station_progress[op.customer_id]
-            station_state["dropped_at"] = self.sim_time
-            station_state["ready_at"] = self.sim_time + self.instance.processing_times[op.customer_id]
-            vehicle.load = max(0, vehicle.load - 1)
-            vehicle.route_index += 1
-            vehicle.target_node = None
-            return
+            if idx == len(vehicle.schedule) - 1 and vehicle.ingress_built:
+                # Arrived at home slot after L-corridor walk.
+                vehicle.position = vehicle.home_slot
+                vehicle.completed = True
+                vehicle.completion_time = self.sim_time
+                continue
 
-        station_state = self.station_progress[op.customer_id]
-        ready_at = station_state["ready_at"]
-        if ready_at is not None and self.sim_time >= ready_at:
-            station_state["picked_at"] = self.sim_time
-            vehicle.load = min(self.instance.capacity, vehicle.load + 1)
-            vehicle.route_index += 1
-            vehicle.target_node = None
-            return
+            # Normal grid-edge arrival: advance index, snap position to
+            # the next visit's node coords, apply service effects.
+            if idx + 1 < len(vehicle.schedule):
+                vehicle.schedule_index = idx + 1
+                next_visit = vehicle.schedule[vehicle.schedule_index]
+                vehicle.position = self.instance.world.coords[next_visit.node_id]
+                vehicle.current_node = next_visit.node_id
+                self._handle_visit_entry(vehicle, vehicle.schedule_index)
+            else:
+                # Schedule exhausted; finalize.
+                vehicle.completed = True
+                vehicle.completion_time = self.sim_time
 
-        vehicle.waiting_customer_id = op.customer_id
-        vehicle.target_node = None
+    def _handle_arrival(self, vehicle: VehicleState) -> None:
+        """Deprecated: replaced by `_handle_visit_entry` and
+        `_resolve_arrivals` after the MAPF integration. Kept as a no-op
+        for any external callers that may still reference it."""
+        return
 
     def _travel_points(
         self,

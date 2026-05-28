@@ -10,7 +10,12 @@
       "Bash(python diagnose_export.py)",
       "Bash(python -m py_compile vrp_rpd_sim/render.py vrp_rpd_sim/unity_export.py main.py)",
       "Bash(rm -f diagnose_export.py)",
-      "Bash(rm -f playback.json)"
+      "Bash(rm -f playback.json)",
+      "Bash(python -c \"import vrp_rpd_sim.model; import vrp_rpd_sim.config; import vrp_rpd_sim.mapf; print\\('imports ok'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python main.py --headless --jobs 8)",
+      "Bash(python main.py --headless)",
+      "Bash(python /tmp/sim_test.py)"
     ]
   }
 }
