@@ -37,6 +37,38 @@ GRID_INTERSECTIONS: List[Coord] = [
 ]
 
 
+# White squares (work cells) -------------------------------------------------
+#
+# The gray corridors run *along* the grid lines, so the cream squares are the
+# gaps between four adjacent intersections. An 8x8 intersection grid therefore
+# encloses a 7x7 = 49 array of white squares. Each square is indexed (cix, ciy)
+# by its SW-corner column/row, cix in 0..COLS-2, ciy in 0..ROWS-2.
+
+WHITE_SQUARE_COLS: int = GRID_COLS - 1
+WHITE_SQUARE_ROWS: int = GRID_ROWS - 1
+
+
+def white_square_center(cix: int, ciy: int) -> Coord:
+    """Center of white square (cix, ciy), where a station is serviced."""
+    return (
+        GRID_XS[cix] + GRID_PITCH_IN / 2.0,
+        GRID_YS[ciy] + GRID_PITCH_IN / 2.0,
+    )
+
+
+def white_square_north_entry(cix: int, ciy: int) -> Coord:
+    """North-edge entry point of square (cix, ciy).
+
+    Sits on the top corridor (y = GRID_YS[ciy + 1]) directly above the
+    center. A robot turns south here to dip into the square — the only way
+    in or out (dead-end pocket).
+    """
+    return (
+        GRID_XS[cix] + GRID_PITCH_IN / 2.0,
+        GRID_YS[ciy + 1],
+    )
+
+
 # Depot geometry -------------------------------------------------------------
 
 # The depot is an L-shape that hooks into the NE grid corner.
@@ -98,7 +130,8 @@ def describe() -> str:
         f"  Grid: {GRID_COLS}x{GRID_ROWS} intersections, pitch {GRID_PITCH_IN} in",
         f"    x = {GRID_XS}",
         f"    y = {GRID_YS}",
-        f"  Stations: all {len(GRID_INTERSECTIONS)} grid intersections are stations",
+        f"  Stations: {WHITE_SQUARE_COLS * WHITE_SQUARE_ROWS} white-square centers "
+        f"({WHITE_SQUARE_COLS}x{WHITE_SQUARE_ROWS}), entered from the north",
         f"  Depot: L-shape, {len(ALL_DEPOT_SLOTS)} parking slots, "
         f"pitch {DEPOT_SLOT_PITCH_IN} in",
         f"    horizontal arm at y = {DEPOT_ARM_Y_IN}, x in {DEPOT_ARM_XS}",

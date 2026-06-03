@@ -299,7 +299,13 @@ class VRPRPDSolver:
                 station_node = self.customer_node(operation.customer_id)
                 travel = self.travel_time(prev_loc, station_node)
                 nodes.add(node_id)
-                adjacency[prev_node].append((node_id, travel))
+                # The edge into an op carries travel plus that op's service
+                # dwell, so completion_times[node] = arrival + service. This
+                # makes the dwell (completion - arrival) the robot's drop or
+                # pickup time, which MAPF reserves the cell for.
+                adjacency[prev_node].append(
+                    (node_id, travel + self._operation_service_time(operation))
+                )
                 indegree[node_id] += 1
                 route_predecessor[node_id] = prev_node
                 route_edge_weight[node_id] = travel
@@ -317,7 +323,11 @@ class VRPRPDSolver:
             drop_node = drop_node_for_customer[customer_id]
             pickup_node = pickup_node_for_customer[customer_id]
             processing = self.instance.processing_times[customer_id]
-            adjacency[drop_node].append((pickup_node, processing))
+            # Reaching the pickup via processing also incurs the pickup dwell,
+            # matching the route-edge convention above (edge into a node
+            # includes that node's service time).
+            pickup_service = self.instance.instance_config.pickup_time_sec
+            adjacency[drop_node].append((pickup_node, processing + pickup_service))
             indegree[pickup_node] += 1
 
         indegree.setdefault("source", 0)
@@ -1395,6 +1405,11 @@ class VRPRPDSolver:
 
     def customer_node(self, customer_id: int) -> str:
         return self.instance.station_by_id[customer_id].node_id
+
+    def _operation_service_time(self, operation: Operation) -> float:
+        """Per-action robot dwell for an op: drop_time for D, pickup_time for P."""
+        config = self.instance.instance_config
+        return config.drop_time_sec if operation.kind == "D" else config.pickup_time_sec
 
     def customer_workload(self, customer_id: int) -> float:
         return (

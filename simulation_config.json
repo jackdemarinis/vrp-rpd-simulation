@@ -1,6 +1,6 @@
 {
   "instance": {
-    "active_job_count": 64,
+    "active_job_count": 49,
     "vehicle_count": 10,
     "vehicle_capacity": 4,
     "alvik_speed_in_per_sec": 5.118110236220472,
@@ -8,6 +8,8 @@
     "processing_time_seed": 7,
     "processing_time_scale": 1.0,
     "fixed_processing_time_sec": null,
+    "drop_time_sec": 0.0,
+    "pickup_time_sec": 0.0,
     "processing_time_overrides": {}
   },
   "solver": {
@@ -47,6 +49,6 @@
     "enabled": true,
     "directory": ".solution_cache",
     "schema_version": 2,
-    "algorithm_version": "2026-05-21-cad"
+    "algorithm_version": "2026-06-03-squares"
   }
 }

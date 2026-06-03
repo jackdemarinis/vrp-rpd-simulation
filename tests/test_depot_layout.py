@@ -20,8 +20,8 @@ class CadLayoutWorldTests(unittest.TestCase):
 
         self.assertEqual(8, len(world.road_xs))
         self.assertEqual(8, len(world.road_ys))
-        self.assertEqual(64, len(stations))
-        self.assertTrue(all(station.side == "intersection" for station in stations))
+        self.assertEqual(49, len(stations))
+        self.assertTrue(all(station.side == "square" for station in stations))
 
     def test_grid_pitch_matches_cad_layout(self) -> None:
         world, _ = build_world()
@@ -59,11 +59,11 @@ class CadLayoutWorldTests(unittest.TestCase):
         self.assertEqual(10, config.ALVIK_COUNT)
         self.assertEqual(10, instance.vehicle_count)
 
-    def test_default_instance_activates_all_64_stations(self) -> None:
+    def test_default_instance_activates_all_49_stations(self) -> None:
         instance = build_instance()
 
-        self.assertEqual(64, len(instance.stations))
-        self.assertEqual(64, len(instance.active_job_ids))
+        self.assertEqual(49, len(instance.stations))
+        self.assertEqual(49, len(instance.active_job_ids))
 
     def test_vehicle_capacity_is_four_and_five_drops_are_infeasible(self) -> None:
         instance = build_instance()

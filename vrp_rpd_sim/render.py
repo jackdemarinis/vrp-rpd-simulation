@@ -37,6 +37,9 @@ HUD_BG = (35, 42, 52)
 ROAD_STRIP = (92, 95, 99)
 ROAD_GAP = (225, 216, 197)
 ROAD_EDGE = (54, 60, 67)
+# Fill for the white-square work cells. Matches the world background so the
+# cells read as openings punched into the gray grid board.
+CELL_FILL = (239, 235, 225)
 DEPOT_BG = (214, 231, 223)
 DEPOT_EDGE = (88, 128, 111)
 STATION_IDLE = (190, 191, 194)
@@ -2381,33 +2384,71 @@ class SimulationApp:
             self.world_width_px,
             self.world_height_px,
         )
-        pygame.draw.rect(self.screen, (239, 235, 225), world_rect)
-        pygame.draw.rect(self.screen, TEXT_DARK, world_rect, width=2)
+        pygame.draw.rect(self.screen, CELL_FILL, world_rect)
 
-        road_xs = self.instance.world.road_xs
-        road_ys = self.instance.world.road_ys
-        for x in road_xs:
-            self._draw_road_segment((x, road_ys[0]), (x, road_ys[-1]))
-        for y in road_ys:
-            self._draw_road_segment((road_xs[0], y), (road_xs[-1], y))
-
-        # L-shaped depot road: vertical column from NE grid corner up to the
-        # horizontal arm, then horizontal arm.
-        grid_corner = (road_xs[-1], road_ys[-1])
-        vertical_top = (cad_layout.DEPOT_VERTICAL_X_IN, cad_layout.DEPOT_ARM_Y_IN)
-        arm_west_end = (cad_layout.DEPOT_ARM_XS[0], cad_layout.DEPOT_ARM_Y_IN)
-        self._draw_road_segment(grid_corner, vertical_top)
-        self._draw_road_segment(vertical_top, arm_west_end)
-
+        self._draw_grid_cells()
+        self._draw_depot_dock()
         self._draw_stations()
         self._draw_depot_slots()
         self._draw_vehicles()
 
-    def _draw_road_segment(self, start_in: Coord, end_in: Coord) -> None:
-        start_px = self._to_screen(start_in)
-        end_px = self._to_screen(end_in)
-        width = max(2, int(round(config.ROAD_WIDTH_IN * self.world_scale)))
-        pygame.draw.line(self.screen, ROAD_STRIP, start_px, end_px, width=width)
+    def _draw_depot_dock(self) -> None:
+        """Gray rounded dock backing the L-shaped depot corridor.
+
+        Drawn as two overlapping rounded rects (a vertical arm rising from
+        the grid board's NE corner and a horizontal arm) so the parked
+        Alviks read as docked to the grid instead of floating in empty
+        space. The arms are wide enough to seat an Alvik tile with a margin.
+        """
+        hw = config.ALVIK_SIZE_IN * 0.5 + 1.5
+        radius = max(3, int(round(2.0 * self.world_scale)))
+        grid_corner_y = self.instance.world.road_ys[-1]
+        arm_y = cad_layout.DEPOT_ARM_Y_IN
+        vert_x = cad_layout.DEPOT_VERTICAL_X_IN
+        arm_west = cad_layout.DEPOT_ARM_XS[0]
+        arm_east = cad_layout.DEPOT_ARM_XS[-1]
+
+        vertical_arm = self._world_rect_to_screen(
+            vert_x - hw, grid_corner_y - hw, vert_x + hw, arm_y + hw
+        )
+        pygame.draw.rect(self.screen, ROAD_STRIP, vertical_arm, border_radius=radius)
+
+        horizontal_arm = self._world_rect_to_screen(
+            arm_west - hw, arm_y - hw, arm_east + hw, arm_y + hw
+        )
+        pygame.draw.rect(self.screen, ROAD_STRIP, horizontal_arm, border_radius=radius)
+
+    def _draw_grid_cells(self) -> None:
+        """Draw the corridor grid as a single gray board with rounded outer
+        corners, then punch the 49 white squares out of it as rounded cream
+        cells. This replaces the old thick-line road strips: drawing the
+        board as one rounded rect removes the square notches that those
+        strips left at the four outer corners, and the cells get rounded
+        corners instead of sharp ones. The gray left between cells is exactly
+        ROAD_WIDTH_IN wide, so the corridors look unchanged."""
+        road_xs = self.instance.world.road_xs
+        road_ys = self.instance.world.road_ys
+        half = config.ROAD_WIDTH_IN / 2.0
+
+        board = self._world_rect_to_screen(
+            road_xs[0] - half,
+            road_ys[0] - half,
+            road_xs[-1] + half,
+            road_ys[-1] + half,
+        )
+        board_radius = max(4, int(round(2.5 * self.world_scale)))
+        pygame.draw.rect(self.screen, ROAD_STRIP, board, border_radius=board_radius)
+
+        cell_radius = max(2, int(round(1.4 * self.world_scale)))
+        for ciy in range(cad_layout.WHITE_SQUARE_ROWS):
+            for cix in range(cad_layout.WHITE_SQUARE_COLS):
+                cell = self._world_rect_to_screen(
+                    road_xs[cix] + half,
+                    road_ys[ciy] + half,
+                    road_xs[cix + 1] - half,
+                    road_ys[ciy + 1] - half,
+                )
+                pygame.draw.rect(self.screen, CELL_FILL, cell, border_radius=cell_radius)
 
     def _draw_depot_slots(self) -> None:
         radius = max(3, int(round(config.ALVIK_SIZE_IN * self.world_scale * 0.35)))
@@ -2458,9 +2499,8 @@ class SimulationApp:
             progress += cycle_len
 
     def _draw_stations(self) -> None:
-        # Stations sit at the 64 grid intersections in the new world. Drawn
-        # as small filled dots so they stay legible without blocking the
-        # roads they're embedded in.
+        # Stations sit at the centers of the 49 white squares. Drawn as small
+        # filled dots in the cream cells, off the corridors the robots travel.
         radius = max(3, int(round(config.ALVIK_SIZE_IN * self.world_scale * 0.28)))
         active_ids = set(self.instance.active_job_ids)
         for station in self.instance.stations:
@@ -2625,6 +2665,21 @@ class SimulationApp:
         x_px = self.world_left_px + (coord[0] * self.world_scale)
         y_px = self.world_top_px + ((config.WORLD_HEIGHT_IN - coord[1]) * self.world_scale)
         return x_px, y_px
+
+    def _world_rect_to_screen(
+        self, x0: float, y0: float, x1: float, y1: float
+    ) -> pygame.Rect:
+        """Screen-space pygame.Rect for the world box [x0, x1] x [y0, y1].
+        Screen Y is flipped, so the NW world corner (x0, y1) is the rect's
+        top-left."""
+        left, top = self._to_screen((x0, y1))
+        right, bottom = self._to_screen((x1, y0))
+        return pygame.Rect(
+            int(round(left)),
+            int(round(top)),
+            int(round(right - left)),
+            int(round(bottom - top)),
+        )
 
     def _fit_font(self, text: str, max_width: int, max_height: int) -> pygame.font.Font:
         size = min(self.font_small.get_height(), max_height)

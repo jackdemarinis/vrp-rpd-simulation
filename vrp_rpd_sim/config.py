@@ -58,13 +58,19 @@ DEPOT_ANCHOR_IN = (
 
 # Stations and processing ----------------------------------------------------
 
-# All 64 grid intersections are stations now (vs. 36 interior-block stations
-# in the old synthetic world).
-ACTIVE_JOB_COUNT = 64
+# The 49 white squares (7x7 cells between the corridors) are the stations now
+# (vs. one-per-intersection, which had no physical work cell to pull into).
+ACTIVE_JOB_COUNT = 49
 PROCESSING_TIME_VARIANT = "base"  # "base", "2x", "5x", "1R10", "1R20"
 PROCESSING_TIME_SEED = 7
 PROCESSING_TIME_SCALE = 1.0
 FIXED_PROCESSING_TIME_SEC = None
+
+# Per-action service dwell, in seconds: how long an Alvik pauses at a cell to
+# perform a drop (D) or a pickup (P). Added on top of the station's processing
+# time (the drop→ready wait). 0.0 keeps the original instantaneous behavior.
+DROP_TIME_SEC = 0.0
+PICKUP_TIME_SEC = 0.0
 
 PROCESSING_TIME_OVERRIDES: dict[int, float] = {}
 
@@ -123,7 +129,7 @@ BRKGA_INFEASIBILITY_PENALTY = 10**6
 DEFAULT_RUNTIME_CONFIG_PATH = Path("simulation_config.json")
 DEFAULT_SOLUTION_CACHE_DIR = ".solution_cache"
 SOLUTION_CACHE_SCHEMA_VERSION = 2
-SOLUTION_CACHE_ALGORITHM_VERSION = "2026-05-21-cad"
+SOLUTION_CACHE_ALGORITHM_VERSION = "2026-06-03-squares"
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,8 @@ class InstanceConfig:
     processing_time_seed: int = PROCESSING_TIME_SEED
     processing_time_scale: float = PROCESSING_TIME_SCALE
     fixed_processing_time_sec: float | None = FIXED_PROCESSING_TIME_SEC
+    drop_time_sec: float = DROP_TIME_SEC
+    pickup_time_sec: float = PICKUP_TIME_SEC
     processing_time_overrides: dict[int, float] = field(
         default_factory=lambda: dict(PROCESSING_TIME_OVERRIDES)
     )
@@ -159,6 +167,10 @@ class InstanceConfig:
             raise ValueError("alvik_speed_in_per_sec must be positive.")
         if self.processing_time_scale <= 0:
             raise ValueError("processing_time_scale must be positive.")
+        if self.drop_time_sec < 0:
+            raise ValueError("drop_time_sec must be non-negative.")
+        if self.pickup_time_sec < 0:
+            raise ValueError("pickup_time_sec must be non-negative.")
 
 
 @dataclass(frozen=True)

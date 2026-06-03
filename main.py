@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 from vrp_rpd_sim import config
@@ -29,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs",
         type=int,
         default=None,
-        help="Number of active jobs to schedule across the 16 perimeter stations.",
+        help="Number of active jobs to schedule across the 49 white-square stations.",
     )
     parser.add_argument(
         "--sim-speed",
@@ -61,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print depot return debug logs while the simulation is running.",
     )
     parser.add_argument(
+        "--no-menu",
+        action="store_true",
+        help="Skip the interactive pre-simulation setup menu (use config/CLI values as-is).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -85,6 +92,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _prompt_float(label: str, default: float) -> float:
+    """Prompt for a non-negative float, defaulting on empty input."""
+    while True:
+        raw = input(f"  {label} [{default:g}]: ").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            print("    Please enter a number (or press Enter to keep the default).")
+            continue
+        if value < 0:
+            print("    Please enter a non-negative number.")
+            continue
+        return value
+
+
+def prompt_timing_menu(instance_config: config.InstanceConfig) -> config.InstanceConfig:
+    """Interactive pre-simulation menu for per-action drop/pickup dwell times.
+
+    Pre-fills with the current config values; an empty entry keeps the
+    default. Auto-skips when stdin isn't an interactive terminal (piped input,
+    CI) so non-interactive runs never block.
+    """
+    if not sys.stdin.isatty():
+        return instance_config
+    print("\n=== Simulation setup — press Enter to keep each [default] ===")
+    drop = _prompt_float("Drop-off time per stop (s)", instance_config.drop_time_sec)
+    pickup = _prompt_float("Pickup time per stop (s)", instance_config.pickup_time_sec)
+    print(f"  Using drop-off {drop:g}s, pickup {pickup:g}s per stop.\n")
+    return replace(instance_config, drop_time_sec=drop, pickup_time_sec=pickup)
+
+
 def main() -> None:
     args = build_parser().parse_args()
     runtime_config = config.load_runtime_config(Path(args.config))
@@ -97,6 +137,14 @@ def main() -> None:
         fullscreen=args.fullscreen,
         seed=args.seed,
     )
+
+    # Interactive pre-sim menu (drop/pickup dwell). Only for live runs; headless
+    # and Unity-export paths and --no-menu skip it, as does a non-TTY stdin.
+    if not args.headless and not args.export_unity_json and not args.no_menu:
+        runtime_config = replace(
+            runtime_config, instance=prompt_timing_menu(runtime_config.instance)
+        )
+
     instance = build_instance(
         instance_config=runtime_config.instance,
     )

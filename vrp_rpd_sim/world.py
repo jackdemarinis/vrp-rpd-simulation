@@ -2,9 +2,12 @@
 
 The world matches `Physical Set Up/Configuration 1.obj`: an 8×8 grid of
 intersections with single-lane two-way roads, plus an L-shaped depot that
-hooks into the NE grid corner. All 64 grid intersections are stations.
-Depot parking has 10 slots (the NE corner doubles as both station and the
-first parking slot).
+hooks into the NE grid corner. The 49 white squares (the 7×7 cream cells
+between the corridors) are the stations: each one has a center node where
+the robot is serviced and a north-entry node on the corridor above it, so a
+station is reached only by dipping south off the top corridor (a dead-end
+pocket). Depot parking has 10 slots (the NE corner is the first parking
+slot).
 """
 
 from __future__ import annotations
@@ -78,7 +81,7 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
         for iy, y in enumerate(road_ys):
             coords[_grid_node_id(ix, iy)] = (x, y)
 
-    # Bidirectional edges between adjacent grid intersections.
+    # Vertical corridor edges between adjacent intersections (unchanged).
     for ix in range(len(road_xs)):
         for iy in range(len(road_ys) - 1):
             _add_edge(
@@ -87,27 +90,49 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
                 _grid_node_id(ix, iy + 1),
                 abs(road_ys[iy + 1] - road_ys[iy]),
             )
+
+    # Horizontal corridor edges. Every horizontal segment on rows 1..ROWS-1
+    # is the *north edge* of the white square directly below it, so we split
+    # it through a north-entry node `n_{cix}_{ciy}` and hang the square's
+    # center node `c_{cix}_{ciy}` off that entry by a southward dip. The
+    # center has degree 1 (only its entry), making the square a dead-end
+    # pocket reachable only from the north. Row-0 segments enclose nothing
+    # below them, so they stay plain edges.
     for iy in range(len(road_ys)):
         for ix in range(len(road_xs) - 1):
-            _add_edge(
-                edges,
-                _grid_node_id(ix, iy),
-                _grid_node_id(ix + 1, iy),
-                abs(road_xs[ix + 1] - road_xs[ix]),
-            )
+            left = _grid_node_id(ix, iy)
+            right = _grid_node_id(ix + 1, iy)
+            segment = abs(road_xs[ix + 1] - road_xs[ix])
+            if iy >= 1:
+                cix, ciy = ix, iy - 1
+                entry_node = _entry_node_id(cix, ciy)
+                center_node = _center_node_id(cix, ciy)
+                coords[entry_node] = cad_layout.white_square_north_entry(cix, ciy)
+                coords[center_node] = cad_layout.white_square_center(cix, ciy)
+                _add_edge(edges, left, entry_node, segment / 2.0)
+                _add_edge(edges, entry_node, right, segment / 2.0)
+                _add_edge(
+                    edges,
+                    entry_node,
+                    center_node,
+                    abs(coords[entry_node][1] - coords[center_node][1]),
+                )
+            else:
+                _add_edge(edges, left, right, segment)
 
-    # All 64 grid intersections are stations. station_id 1..64, row-major
-    # from SW so id 1 = (col 0, row 0) and id 64 = (col 7, row 7).
+    # 49 stations, one per white square, at the square centers. station_id
+    # 1..49 row-major from SW so id 1 = square (col 0, row 0) and id 49 =
+    # square (col 6, row 6).
     stations: List[Station] = []
     station_id = 1
-    for iy in range(len(road_ys)):
-        for ix in range(len(road_xs)):
-            node_id = _grid_node_id(ix, iy)
+    for ciy in range(cad_layout.WHITE_SQUARE_ROWS):
+        for cix in range(cad_layout.WHITE_SQUARE_COLS):
+            node_id = _center_node_id(cix, ciy)
             stations.append(
                 Station(
                     station_id=station_id,
                     name=str(station_id),
-                    side="intersection",
+                    side="square",
                     node_id=node_id,
                     coord=coords[node_id],
                 )
@@ -238,6 +263,16 @@ def select_active_job_ids(stations: Iterable[Station], count: int) -> List[int]:
 
 def _grid_node_id(ix: int, iy: int) -> str:
     return f"i_{ix}_{iy}"
+
+
+def _center_node_id(cix: int, ciy: int) -> str:
+    """Service node at the center of white square (cix, ciy)."""
+    return f"c_{cix}_{ciy}"
+
+
+def _entry_node_id(cix: int, ciy: int) -> str:
+    """North-edge entry node for white square (cix, ciy)."""
+    return f"n_{cix}_{ciy}"
 
 
 def _add_edge(

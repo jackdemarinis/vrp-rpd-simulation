@@ -833,11 +833,16 @@ def _plan_one_agent(
 
         i = j
 
-    # Return leg to depot. Reserve the depot vertex for the ingress
-    # corridor window using this vehicle's actual walk time (depends on
-    # which slot it parks at, which matches its priority rank since slots
-    # are dynamically assigned deepest-first in arrival order).
+    # Return leg to depot. The full corridor walk (`ingress_window`) still
+    # counts toward this vehicle's return time, but the depot mouth is only
+    # reserved for a body-clearance follow gap (`mouth_hold`) at the crossing
+    # instant — not the whole walk. Parking is deepest-first by arrival
+    # order, so returning vehicles file in nose-to-tail at clearance spacing
+    # and a follower always stops short of the vehicle ahead, never passing a
+    # parked Alvik. Holding the mouth for the entire walk (as before) forced
+    # them to enter and park strictly one at a time.
     ingress_window = max(ingress_walk_sec, EPS)
+    mouth_hold = max(EPS, mapf_config.clearance_sec)
     if current_node != depot:
         leg = _space_time_astar(
             start_node=current_node,
@@ -849,7 +854,7 @@ def _plan_one_agent(
             vehicle_id=vehicle_id,
             horizon=horizon,
             config=mapf_config,
-            goal_hold_duration=ingress_window,
+            goal_hold_duration=mouth_hold,
         )
         if leg is None:
             return None
@@ -871,11 +876,14 @@ def _plan_one_agent(
         current_time = visits[-1].t_enter
 
     final_visit = visits[-1]
+    # return_time = fully parked (full corridor walk); the committed mouth
+    # reservation only spans the clearance follow gap so the next returning
+    # vehicle can cross right behind this one instead of waiting it out.
     ingress_exit = final_visit.t_enter + ingress_window
     visits[-1] = NodeVisit(
         node_id=final_visit.node_id,
         t_enter=final_visit.t_enter,
-        t_exit=ingress_exit,
+        t_exit=final_visit.t_enter + mouth_hold,
         is_service=False,
         customer_id=None,
         op_kind=None,
