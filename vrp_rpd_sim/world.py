@@ -98,8 +98,7 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
                     abs(road_ys[iy + 1] - road_ys[iy]),
                 )
 
-        # Stations live on the lower WHITE_SQUARE_LAYERS planes; the top
-        # plane is the depot layer and carries plain corridors only.
+        # Stations occupy every Z-plane (the top plane also hosts the depot).
         has_stations = iz < cad_layout.WHITE_SQUARE_LAYERS
 
         # In-plane horizontal corridor edges. On station planes, every
@@ -107,8 +106,8 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
         # cell directly below it, so we split it through a north-entry node
         # and hang the cell's center node off that entry by a southward dip.
         # The center has degree 1, making the cell a dead-end pocket
-        # reachable only from the north. Row-0 segments (and every segment
-        # on the depot plane) enclose no cell, so they stay plain edges.
+        # reachable only from the north. Row-0 segments enclose no cell, so
+        # they stay plain edges.
         for iy in range(len(road_ys)):
             for ix in range(len(road_xs) - 1):
                 left = _grid_node_id(ix, iy, iz)
@@ -144,9 +143,9 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
                     abs(road_zs[iz + 1] - road_zs[iz]),
                 )
 
-    # 343 stations, one per cube cell, at the cell centers. station_id 1..343
-    # is layer-major then row-major from the SW-bottom so id 1 = cell
-    # (col 0, row 0, layer 0) and id 343 = cell (col 6, row 6, layer 6).
+    # 343 stations (7x7x7), one per cube cell, at the cell centers. station_id
+    # 1..343 is layer-major then row-major from the SW-bottom so id 1 = cell
+    # (col 0, row 0, layer 0) and id 343 = cell (col 6, row 6, top layer).
     stations: List[Station] = []
     station_id = 1
     for ciz in range(cad_layout.WHITE_SQUARE_LAYERS):
@@ -164,11 +163,11 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
                 )
                 station_id += 1
 
-    # Depot abstract node sits coincident with the top-layer NE grid corner.
-    # Outgoing vehicles transition depot → i_7_7_7 with zero travel cost;
-    # inbound vehicles do the reverse, then descend into the cube. The
-    # depot's physical L-shape is handled outside the routing graph by the
-    # render-layer corridor logic.
+    # Depot abstract node sits coincident with the top-plane NE grid corner
+    # (i_7_7_6). Outgoing vehicles transition depot → that corner with zero
+    # travel cost; inbound vehicles do the reverse, then descend into the
+    # cube. The depot's physical L-shape is handled outside the routing graph
+    # by the render-layer corridor logic.
     depot_node = "depot"
     grid_ne_corner = _grid_node_id(
         len(road_xs) - 1, len(road_ys) - 1, len(road_zs) - 1

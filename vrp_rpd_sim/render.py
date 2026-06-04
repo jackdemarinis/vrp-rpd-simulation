@@ -391,11 +391,11 @@ class SimulationApp:
             return
         # --- Isometric 3D view controls ---
         if event.key == pygame.K_LEFTBRACKET:
-            self.iso_yaw -= math.radians(15)
+            self.iso_yaw += math.radians(15)
             self._compute_iso_params()
             return
         if event.key == pygame.K_RIGHTBRACKET:
-            self.iso_yaw += math.radians(15)
+            self.iso_yaw -= math.radians(15)
             self._compute_iso_params()
             return
         if event.key == pygame.K_UP:
@@ -430,9 +430,10 @@ class SimulationApp:
         dx = pos[0] - self.last_drag_pos[0]
         dy = pos[1] - self.last_drag_pos[1]
         self.last_drag_pos = pos
-        # Horizontal drag spins around the vertical axis; vertical drag tilts.
-        self.iso_yaw += dx * 0.01
-        self.iso_pitch = max(0.08, min(1.3, self.iso_pitch - dy * 0.004))
+        # Grab-and-drag feel: the cube follows the cursor. Dragging right spins
+        # it right; dragging down tilts its top toward you.
+        self.iso_yaw -= dx * 0.01
+        self.iso_pitch = max(0.08, min(1.3, self.iso_pitch + dy * 0.004))
         self._compute_iso_params()
 
     def _zoom_view(self, wheel_y: float) -> None:

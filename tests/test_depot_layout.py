@@ -18,19 +18,22 @@ class CadLayoutWorldTests(unittest.TestCase):
     def tearDown(self) -> None:
         pygame.quit()
 
-    def test_lattice_is_eight_cubed_with_343_stations(self) -> None:
+    def test_lattice_is_8x8x7_with_343_stations(self) -> None:
         world, stations = build_world()
 
         self.assertEqual(8, len(world.road_xs))
         self.assertEqual(8, len(world.road_ys))
-        self.assertEqual(8, len(world.road_zs))
+        self.assertEqual(7, len(world.road_zs))
         # 7x7x7 cube cells, each a station.
         self.assertEqual(343, len(stations))
         self.assertTrue(all(station.side == "cube" for station in stations))
-        # Stations occupy the 7 lower Z-planes; the top plane is the depot.
+        # Stations occupy every Z-plane, including the top one (which also
+        # hosts the depot — the depot no longer owns a dedicated empty layer).
         station_planes = sorted({round(s.coord[2], 4) for s in stations})
-        self.assertEqual(cad_layout.GRID_ZS[:-1], station_planes)
-        self.assertNotIn(cad_layout.GRID_ZS[-1], station_planes)
+        self.assertEqual(cad_layout.GRID_ZS, station_planes)
+        depot_z = round(world.coords["depot"][2], 4)
+        self.assertEqual(cad_layout.GRID_ZS[-1], depot_z)
+        self.assertIn(depot_z, station_planes)
 
     def test_lattice_has_vertical_edges(self) -> None:
         world, _ = build_world()

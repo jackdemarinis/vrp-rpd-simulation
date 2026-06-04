@@ -2,11 +2,12 @@
 
 Source: `Physical Set Up/Configuration 1.obj`, parsed 2026-05-21. The
 original 8x8 grid is replicated up a third (Z / depth) axis to form an
-8x8x8 intersection lattice — "as if the agents were under water and the
+8x8x7 intersection lattice — "as if the agents were under water and the
 stations were in a cube instead of a square." Z uses the same pitch as
 X/Y. The south-west-bottom grid intersection sits at (0, 0, 0); +Y points
-"north" (toward the depot) and +Z points "up". The depot stays a flat
-L-shape on the top Z-layer; rendering may flip axes for display.
+"north" (toward the depot) and +Z points "up". Stations fill every Z-plane
+(7x7x7 = 343 cells); the depot shares the top plane (its NE corner) rather
+than owning a separate layer. Rendering may flip axes for display.
 
 This module is intentionally self-contained — it does not import anything
 from the rest of the simulation.
@@ -29,7 +30,10 @@ RAW_ORIGIN_OFFSET_IN: Tuple[float, float] = (13.30, 9.96)
 GRID_PITCH_IN: float = 9.88
 GRID_ROWS: int = 8
 GRID_COLS: int = 8
-GRID_LAYERS: int = 8  # number of Z (depth) layers — the cube's height
+# Number of Z (depth) planes. Stations sit on every plane; the depot shares
+# the top plane (its NE corner), so there is no dedicated empty depot layer.
+# 7 planes x 7x7 cells = 343 stations.
+GRID_LAYERS: int = 7
 
 GRID_XS: List[float] = [round(i * GRID_PITCH_IN, 4) for i in range(GRID_COLS)]
 GRID_YS: List[float] = [round(i * GRID_PITCH_IN, 4) for i in range(GRID_ROWS)]
@@ -51,16 +55,18 @@ GRID_INTERSECTIONS: List[Coord] = [
 
 WHITE_SQUARE_COLS: int = GRID_COLS - 1
 WHITE_SQUARE_ROWS: int = GRID_ROWS - 1
-WHITE_SQUARE_LAYERS: int = GRID_LAYERS - 1
+# Stations occupy every Z-plane (including the top one, which also hosts the
+# depot at its NE corner) — so there are GRID_LAYERS station planes.
+WHITE_SQUARE_LAYERS: int = GRID_LAYERS
 
 
 def white_square_center(cix: int, ciy: int, ciz: int) -> Coord:
     """Center of station cell (cix, ciy) on Z-plane ciz, where it's serviced.
 
-    Stations live on the 7 lower intersection planes (ciz in
-    0..WHITE_SQUARE_LAYERS-1); the top plane is reserved for the depot. The
+    Stations live on every Z-plane (ciz in 0..WHITE_SQUARE_LAYERS-1). The
     center sits exactly on its Z-plane and is offset to the cell midpoint in
-    X/Y, so each plane reproduces the original 2D pocket layout.
+    X/Y, so each plane reproduces the original 2D pocket layout. The depot
+    shares the top plane (its NE corner) rather than owning a separate layer.
     """
     return (
         GRID_XS[cix] + GRID_PITCH_IN / 2.0,
