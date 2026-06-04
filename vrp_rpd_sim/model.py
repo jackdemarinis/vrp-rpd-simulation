@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 if TYPE_CHECKING:
     from .config import InstanceConfig
 
-Coord = Tuple[float, float]
+Coord = Tuple[float, float, float]
 Route = List["Operation"]
 Routes = List[Route]
 
@@ -40,6 +40,7 @@ class WorldGraph:
     shortest_paths: Dict[Tuple[str, str], List[str]]
     road_xs: List[float]
     road_ys: List[float]
+    road_zs: List[float]
     depot_anchor: Coord
     depot_slots: List[Coord]
     depot_entries: Dict[str, List[Coord]]

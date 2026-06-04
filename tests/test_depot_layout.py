@@ -5,7 +5,10 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame
 
+from dataclasses import replace
+
 from vrp_rpd_sim import cad_layout, config
+from vrp_rpd_sim.mapf import plan_space_time, validate
 from vrp_rpd_sim.model import Operation
 from vrp_rpd_sim.solver import VRPRPDSolver
 from vrp_rpd_sim.world import build_instance, build_world
@@ -15,13 +18,34 @@ class CadLayoutWorldTests(unittest.TestCase):
     def tearDown(self) -> None:
         pygame.quit()
 
-    def test_grid_has_eight_by_eight_intersections(self) -> None:
+    def test_lattice_is_eight_cubed_with_343_stations(self) -> None:
         world, stations = build_world()
 
         self.assertEqual(8, len(world.road_xs))
         self.assertEqual(8, len(world.road_ys))
-        self.assertEqual(49, len(stations))
-        self.assertTrue(all(station.side == "square" for station in stations))
+        self.assertEqual(8, len(world.road_zs))
+        # 7x7x7 cube cells, each a station.
+        self.assertEqual(343, len(stations))
+        self.assertTrue(all(station.side == "cube" for station in stations))
+        # Stations occupy the 7 lower Z-planes; the top plane is the depot.
+        station_planes = sorted({round(s.coord[2], 4) for s in stations})
+        self.assertEqual(cad_layout.GRID_ZS[:-1], station_planes)
+        self.assertNotIn(cad_layout.GRID_ZS[-1], station_planes)
+
+    def test_lattice_has_vertical_edges(self) -> None:
+        world, _ = build_world()
+
+        # Every interior intersection should connect up and down a layer.
+        up_neighbor = "i_3_3_4"
+        self.assertIn(
+            up_neighbor,
+            {n for n, _ in world.edges["i_3_3_3"]},
+            msg="missing vertical (Z) corridor edge",
+        )
+        # A grid node should reach 6 neighbours (N/S/E/W + up/down) in the
+        # interior of the cube.
+        interior_degree = len(world.edges["i_3_3_3"])
+        self.assertEqual(6, interior_degree)
 
     def test_grid_pitch_matches_cad_layout(self) -> None:
         world, _ = build_world()
@@ -49,9 +73,11 @@ class CadLayoutWorldTests(unittest.TestCase):
 
         self.assertIn("main", world.depot_entries)
         self.assertEqual(1, len(world.depot_entries["main"]))
-        # Entry coincides with the NE grid intersection.
-        ne_corner_coord = world.coords[f"i_{len(world.road_xs) - 1}_{len(world.road_ys) - 1}"]
-        self.assertEqual(ne_corner_coord, world.depot_entries["main"][0])
+        # Entry coincides with the top-layer NE grid intersection.
+        ne_corner = (
+            f"i_{len(world.road_xs) - 1}_{len(world.road_ys) - 1}_{len(world.road_zs) - 1}"
+        )
+        self.assertEqual(world.coords[ne_corner], world.depot_entries["main"][0])
 
     def test_alvik_fleet_size_is_ten(self) -> None:
         instance = build_instance()
@@ -59,11 +85,35 @@ class CadLayoutWorldTests(unittest.TestCase):
         self.assertEqual(10, config.ALVIK_COUNT)
         self.assertEqual(10, instance.vehicle_count)
 
-    def test_default_instance_activates_all_49_stations(self) -> None:
+    def test_default_instance_has_343_stations_and_active_subset(self) -> None:
         instance = build_instance()
 
-        self.assertEqual(49, len(instance.stations))
-        self.assertEqual(49, len(instance.active_job_ids))
+        self.assertEqual(343, len(instance.stations))
+        self.assertEqual(config.ACTIVE_JOB_COUNT, len(instance.active_job_ids))
+        self.assertLessEqual(len(instance.active_job_ids), len(instance.stations))
+
+    def test_mapf_plans_through_z_without_conflicts(self) -> None:
+        runtime = config.default_runtime_config()
+        runtime = replace(
+            runtime,
+            instance=replace(runtime.instance, active_job_count=6, vehicle_count=2),
+        )
+        instance = build_instance(instance_config=runtime.instance)
+        solver = VRPRPDSolver(instance, solver_config=runtime.solver)
+        result = solver.solve()
+        self.assertTrue(result.best.feasible, msg=result.best.reason)
+
+        scheduled = plan_space_time(instance, solver, result.best, runtime.mapf)
+        # Raises on any vertex/edge conflict — vertical edges must not break it.
+        validate(scheduled, clearance_sec=runtime.mapf.clearance_sec)
+
+        # At least one vehicle's route must change depth (descend into cube).
+        changes_z = any(
+            len({round(instance.world.coords[v.node_id][2], 4) for v in visits}) > 1
+            for visits in scheduled.paths.values()
+            if visits
+        )
+        self.assertTrue(changes_z, msg="no planned path traverses the Z axis")
 
     def test_vehicle_capacity_is_four_and_five_drops_are_infeasible(self) -> None:
         instance = build_instance()

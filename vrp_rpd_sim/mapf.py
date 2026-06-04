@@ -891,14 +891,17 @@ def _plan_one_agent(
     return visits, ingress_exit
 
 
-def _corridor_distance_for_slot(slot: Tuple[float, float], depot_coord: Tuple[float, float]) -> float:
+def _corridor_distance_for_slot(
+    slot: Tuple[float, ...], depot_coord: Tuple[float, ...]
+) -> float:
     """L-corridor Manhattan walk distance from depot mouth to a parking slot.
 
-    The depot is L-shaped: a vertical arm from the mouth up to a corner,
-    then a horizontal arm. Slots lie on one of the two arms, so the path
-    distance equals |dx| + |dy|.
+    The depot is L-shaped and flat on the top Z-layer: a vertical arm from
+    the mouth up to a corner, then a horizontal arm. Slots lie on one of the
+    two arms, so the path distance equals |dx| + |dy| (+ |dz|, which is 0
+    while the depot stays planar but kept general).
     """
-    return abs(slot[0] - depot_coord[0]) + abs(slot[1] - depot_coord[1])
+    return sum(abs(s - d) for s, d in zip(slot, depot_coord))
 
 
 def _per_vehicle_corridor_times(
@@ -918,9 +921,10 @@ def _per_vehicle_corridor_times(
     ordered_slots = sorted(
         instance.world.depot_slots,
         key=lambda s: (
-            math.hypot(s[0] - depot_coord[0], s[1] - depot_coord[1]),
+            math.dist(s, depot_coord),
             -s[1],
             -s[0],
+            -s[2],
         ),
     )
     active_set = set(active_vehicle_ids)
@@ -949,11 +953,11 @@ def _per_vehicle_corridor_times(
 def _depot_mouth_node(instance: Instance) -> str | None:
     """Return the grid node coincident with the depot's coordinate.
 
-    The depot is a virtual node that shares a (x, y) with the NE grid
-    corner (typically `i_7_7`). The MAPF graph treats them as distinct
-    IDs but physically they're the same spot. Callers use this to bind
-    depot-vertex reservations onto the grid node so other vehicles can't
-    pass through the corner while the corridor is in use.
+    The depot is a virtual node that shares an (x, y, z) with the top-layer
+    NE grid corner (typically `i_7_7_7`). The MAPF graph treats them as
+    distinct IDs but physically they're the same spot. Callers use this to
+    bind depot-vertex reservations onto the grid node so other vehicles
+    can't pass through the corner while the corridor is in use.
     """
     depot = instance.depot_node
     depot_coord = instance.world.coords.get(depot)
@@ -962,10 +966,7 @@ def _depot_mouth_node(instance: Instance) -> str | None:
     for node, coord in instance.world.coords.items():
         if node == depot:
             continue
-        if (
-            abs(coord[0] - depot_coord[0]) < 1e-6
-            and abs(coord[1] - depot_coord[1]) < 1e-6
-        ):
+        if all(abs(c - d) < 1e-6 for c, d in zip(coord, depot_coord)):
             return node
     return None
 

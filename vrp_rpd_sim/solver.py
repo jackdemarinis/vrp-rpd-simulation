@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from . import config
-from .model import EvaluatedSolution, Instance, Operation, OperationEvent, Routes
+from .model import Coord, EvaluatedSolution, Instance, Operation, OperationEvent, Routes
 
 
 @dataclass
@@ -450,7 +450,10 @@ class VRPRPDSolver:
         return current
 
     def _sweep_clusters(self) -> List[List[int]]:
-        depot_x, depot_y = self.instance.world.depot_anchor
+        # Polar sweep seed ordering, projected onto the XY plane (depth/Z is
+        # ignored for this initial heuristic clustering). The MAPF stage and
+        # the distance-based optimizers handle Z; this only seeds clusters.
+        depot_x, depot_y = self.instance.world.depot_anchor[0], self.instance.world.depot_anchor[1]
         ordered = sorted(
             self.customers,
             key=lambda customer_id: math.atan2(
@@ -1420,38 +1423,26 @@ class VRPRPDSolver:
     def travel_time(self, source: str, target: str) -> float:
         return self.travel_times_dense[self.node_index[source]][self.node_index[target]]
 
-    def path_coords(self, source: str, target: str) -> List[Tuple[float, float]]:
+    def path_coords(self, source: str, target: str) -> List[Coord]:
         node_path = self.instance.world.shortest_paths[(source, target)]
         return self._lane_polyline(node_path)
 
-    def lane_polyline(self, node_path: Sequence[str]) -> List[Tuple[float, float]]:
-        """Public lane-adjusted polyline for an arbitrary node path."""
+    def lane_polyline(self, node_path: Sequence[str]) -> List[Coord]:
+        """Public polyline for an arbitrary node path."""
         return self._lane_polyline(node_path)
 
-    def _lane_polyline(self, node_path: Sequence[str]) -> List[Tuple[float, float]]:
+    def _lane_polyline(self, node_path: Sequence[str]) -> List[Coord]:
+        # The cube lattice has only axis-aligned edges, so the sequence of
+        # node-center coordinates is already an orthogonal, grid-following
+        # polyline. The old 2D lane-offset / orthogonalization machinery
+        # (`_lane_point`, `orthogonalize_points`, `simplify_axis_reversals`)
+        # only made sense in the plane and would mangle the Z axis, so we
+        # just dedupe the raw 3D node centers. Lane offset is 0 anyway.
         if not node_path:
             return []
-        if len(node_path) == 1:
-            return [self.instance.world.coords[node_path[0]]]
-
-        points: List[Tuple[float, float]] = []
-        for index, node_id in enumerate(node_path):
-            coord = self.instance.world.coords[node_id]
-            if node_id == self.instance.depot_node or node_id.startswith("station_"):
-                points.append(coord)
-                continue
-
-            prev_dir = self._segment_direction(node_path[index - 1], node_id) if index > 0 else None
-            next_dir = (
-                self._segment_direction(node_id, node_path[index + 1])
-                if index + 1 < len(node_path)
-                else None
-            )
-            prev_dir = prev_dir or next_dir
-            next_dir = next_dir or prev_dir
-            points.append(self._lane_point(coord, prev_dir, next_dir))
-
-        return simplify_axis_reversals(orthogonalize_points(dedupe_points(points)))
+        return dedupe_points(
+            [self.instance.world.coords[node_id] for node_id in node_path]
+        )
 
     def _lane_point(
         self,
@@ -1530,8 +1521,8 @@ def clamp01(value: float) -> float:
     return min(0.999999, max(0.0, value))
 
 
-def dedupe_points(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    deduped: List[Tuple[float, float]] = []
+def dedupe_points(points: Sequence[Coord]) -> List[Coord]:
+    deduped: List[Coord] = []
     for point in points:
         if not deduped or not points_are_equal(point, deduped[-1]):
             deduped.append(point)
@@ -1635,5 +1626,7 @@ def segment_axis(
     return None
 
 
-def points_are_equal(first: Tuple[float, float], second: Tuple[float, float]) -> bool:
-    return math.isclose(first[0], second[0]) and math.isclose(first[1], second[1])
+def points_are_equal(first: Coord, second: Coord) -> bool:
+    return len(first) == len(second) and all(
+        math.isclose(a, b) for a, b in zip(first, second)
+    )

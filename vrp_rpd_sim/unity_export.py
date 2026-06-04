@@ -16,7 +16,7 @@ from .solver import SolverRunResult, VRPRPDSolver
 from .world import build_instance
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # bumped for the 3D cube world (adds Z / height fields)
 
 
 def build_unity_export(
@@ -88,18 +88,21 @@ def build_unity_export(
         "schemaVersion": SCHEMA_VERSION,
         "generatedAtUtc": datetime.now(timezone.utc).isoformat(),
         "coordinateMapping": {
-            "pygameXToUnity": "x",
-            "pygameYToUnity": "z",
+            "worldXToUnity": "x",
+            "worldYToUnity": "z",
+            "worldZToUnity": "y",
             "unityHeightAxis": "y",
             "sourceUnits": "inches",
             "recommendedUnityScale": 0.0254,
         },
         "worldWidthIn": config.WORLD_WIDTH_IN,
         "worldHeightIn": config.WORLD_HEIGHT_IN,
+        "worldDepthIn": config.WORLD_DEPTH_IN,
         "roadWidthIn": config.ROAD_WIDTH_IN,
         "laneCenterOffsetIn": config.LANE_CENTER_OFFSET_IN,
         "roadXs": [float(value) for value in instance.world.road_xs],
         "roadYs": [float(value) for value in instance.world.road_ys],
+        "roadZs": [float(value) for value in instance.world.road_zs],
         "activeJobIds": [int(customer_id) for customer_id in instance.active_job_ids],
         "vehicleCapacity": instance.capacity,
         "vehicleCount": instance.vehicle_count,
@@ -174,18 +177,21 @@ def build_payload_from_recording(
         "schemaVersion": SCHEMA_VERSION,
         "generatedAtUtc": datetime.now(timezone.utc).isoformat(),
         "coordinateMapping": {
-            "pygameXToUnity": "x",
-            "pygameYToUnity": "z",
+            "worldXToUnity": "x",
+            "worldYToUnity": "z",
+            "worldZToUnity": "y",
             "unityHeightAxis": "y",
             "sourceUnits": "inches",
             "recommendedUnityScale": 0.0254,
         },
         "worldWidthIn": config.WORLD_WIDTH_IN,
         "worldHeightIn": config.WORLD_HEIGHT_IN,
+        "worldDepthIn": config.WORLD_DEPTH_IN,
         "roadWidthIn": config.ROAD_WIDTH_IN,
         "laneCenterOffsetIn": config.LANE_CENTER_OFFSET_IN,
         "roadXs": [float(value) for value in instance.world.road_xs],
         "roadYs": [float(value) for value in instance.world.road_ys],
+        "roadZs": [float(value) for value in instance.world.road_zs],
         "activeJobIds": [int(customer_id) for customer_id in instance.active_job_ids],
         "vehicleCapacity": instance.capacity,
         "vehicleCount": instance.vehicle_count,
@@ -276,6 +282,7 @@ def _build_station_specs(instance) -> List[Dict[str, Any]]:
             "nodeId": station.node_id,
             "x": station.coord[0],
             "y": station.coord[1],
+            "z": station.coord[2],
             "processingTimeSec": instance.processing_times[station.station_id],
             "active": station.station_id in instance.active_job_ids,
         }
@@ -294,6 +301,7 @@ def _build_vehicle_specs(app: SimulationApp) -> List[Dict[str, Any]]:
                 "colorRgb": list(color),
                 "startX": vehicle.position[0],
                 "startY": vehicle.position[1],
+                "startZ": vehicle.position[2],
                 "startLoad": vehicle.load,
                 "route": [
                     {
@@ -330,6 +338,7 @@ def _capture_frame(app: SimulationApp) -> Dict[str, Any]:
                 "vehicleId": vehicle.vehicle_id,
                 "x": vehicle.position[0],
                 "y": vehicle.position[1],
+                "z": vehicle.position[2],
                 "load": vehicle.load,
                 "routeIndex": vehicle.route_index,
                 "currentNode": vehicle.current_node,
@@ -339,6 +348,7 @@ def _capture_frame(app: SimulationApp) -> Dict[str, Any]:
                 "completionTimeSec": _nullable_time(vehicle.completion_time),
                 "homeX": vehicle.home_slot[0],
                 "homeY": vehicle.home_slot[1],
+                "homeZ": vehicle.home_slot[2],
                 "hasActivePath": vehicle.active_path is not None,
             }
         )
@@ -354,9 +364,13 @@ def _capture_frame(app: SimulationApp) -> Dict[str, Any]:
 
 
 def _point_dict(point) -> Dict[str, float]:
+    # World coords are (x, y, z) in inches where z is depth/height in the
+    # cube. See `coordinateMapping`: world x -> Unity x, world y -> Unity z
+    # (ground plane), world z -> Unity y (height).
     return {
         "x": float(point[0]),
         "y": float(point[1]),
+        "z": float(point[2]),
     }
 
 

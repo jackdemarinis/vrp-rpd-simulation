@@ -72,80 +72,107 @@ def build_instance(
 def build_world() -> Tuple[WorldGraph, List[Station]]:
     road_xs = list(cad_layout.GRID_XS)
     road_ys = list(cad_layout.GRID_YS)
+    road_zs = list(cad_layout.GRID_ZS)
 
     coords: Dict[str, Coord] = {}
     edges: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
 
-    # 64 grid intersections, indexed (ix, iy) with ix=col, iy=row, SW origin.
-    for ix, x in enumerate(road_xs):
-        for iy, y in enumerate(road_ys):
-            coords[_grid_node_id(ix, iy)] = (x, y)
+    # Grid intersections, indexed (ix, iy, iz) with ix=col, iy=row, iz=layer,
+    # SW-bottom origin.
+    for iz, z in enumerate(road_zs):
+        for ix, x in enumerate(road_xs):
+            for iy, y in enumerate(road_ys):
+                coords[_grid_node_id(ix, iy, iz)] = (x, y, z)
 
-    # Vertical corridor edges between adjacent intersections (unchanged).
-    for ix in range(len(road_xs)):
-        for iy in range(len(road_ys) - 1):
-            _add_edge(
-                edges,
-                _grid_node_id(ix, iy),
-                _grid_node_id(ix, iy + 1),
-                abs(road_ys[iy + 1] - road_ys[iy]),
-            )
-
-    # Horizontal corridor edges. Every horizontal segment on rows 1..ROWS-1
-    # is the *north edge* of the white square directly below it, so we split
-    # it through a north-entry node `n_{cix}_{ciy}` and hang the square's
-    # center node `c_{cix}_{ciy}` off that entry by a southward dip. The
-    # center has degree 1 (only its entry), making the square a dead-end
-    # pocket reachable only from the north. Row-0 segments enclose nothing
-    # below them, so they stay plain edges.
-    for iy in range(len(road_ys)):
-        for ix in range(len(road_xs) - 1):
-            left = _grid_node_id(ix, iy)
-            right = _grid_node_id(ix + 1, iy)
-            segment = abs(road_xs[ix + 1] - road_xs[ix])
-            if iy >= 1:
-                cix, ciy = ix, iy - 1
-                entry_node = _entry_node_id(cix, ciy)
-                center_node = _center_node_id(cix, ciy)
-                coords[entry_node] = cad_layout.white_square_north_entry(cix, ciy)
-                coords[center_node] = cad_layout.white_square_center(cix, ciy)
-                _add_edge(edges, left, entry_node, segment / 2.0)
-                _add_edge(edges, entry_node, right, segment / 2.0)
+    # Per-layer in-plane corridors + dead-end station pockets. Each Z-layer
+    # reproduces the original 2D grid verbatim; layers are stitched together
+    # by the vertical edges added afterwards.
+    for iz in range(len(road_zs)):
+        # In-plane vertical (north-south) corridor edges.
+        for ix in range(len(road_xs)):
+            for iy in range(len(road_ys) - 1):
                 _add_edge(
                     edges,
-                    entry_node,
-                    center_node,
-                    abs(coords[entry_node][1] - coords[center_node][1]),
+                    _grid_node_id(ix, iy, iz),
+                    _grid_node_id(ix, iy + 1, iz),
+                    abs(road_ys[iy + 1] - road_ys[iy]),
                 )
-            else:
-                _add_edge(edges, left, right, segment)
 
-    # 49 stations, one per white square, at the square centers. station_id
-    # 1..49 row-major from SW so id 1 = square (col 0, row 0) and id 49 =
-    # square (col 6, row 6).
+        # Stations live on the lower WHITE_SQUARE_LAYERS planes; the top
+        # plane is the depot layer and carries plain corridors only.
+        has_stations = iz < cad_layout.WHITE_SQUARE_LAYERS
+
+        # In-plane horizontal corridor edges. On station planes, every
+        # horizontal segment on rows 1..ROWS-1 is the *north edge* of the
+        # cell directly below it, so we split it through a north-entry node
+        # and hang the cell's center node off that entry by a southward dip.
+        # The center has degree 1, making the cell a dead-end pocket
+        # reachable only from the north. Row-0 segments (and every segment
+        # on the depot plane) enclose no cell, so they stay plain edges.
+        for iy in range(len(road_ys)):
+            for ix in range(len(road_xs) - 1):
+                left = _grid_node_id(ix, iy, iz)
+                right = _grid_node_id(ix + 1, iy, iz)
+                segment = abs(road_xs[ix + 1] - road_xs[ix])
+                if iy >= 1 and has_stations:
+                    cix, ciy, ciz = ix, iy - 1, iz
+                    entry_node = _entry_node_id(cix, ciy, ciz)
+                    center_node = _center_node_id(cix, ciy, ciz)
+                    coords[entry_node] = cad_layout.white_square_north_entry(cix, ciy, ciz)
+                    coords[center_node] = cad_layout.white_square_center(cix, ciy, ciz)
+                    _add_edge(edges, left, entry_node, segment / 2.0)
+                    _add_edge(edges, entry_node, right, segment / 2.0)
+                    _add_edge(
+                        edges,
+                        entry_node,
+                        center_node,
+                        abs(coords[entry_node][1] - coords[center_node][1]),
+                    )
+                else:
+                    _add_edge(edges, left, right, segment)
+
+    # Vertical (Z / up-down) corridor edges connecting coincident
+    # intersections on adjacent layers. These give intersections 6-way
+    # connectivity (N/S/E/W + up/down); station pockets stay degree 1.
+    for iz in range(len(road_zs) - 1):
+        for ix in range(len(road_xs)):
+            for iy in range(len(road_ys)):
+                _add_edge(
+                    edges,
+                    _grid_node_id(ix, iy, iz),
+                    _grid_node_id(ix, iy, iz + 1),
+                    abs(road_zs[iz + 1] - road_zs[iz]),
+                )
+
+    # 343 stations, one per cube cell, at the cell centers. station_id 1..343
+    # is layer-major then row-major from the SW-bottom so id 1 = cell
+    # (col 0, row 0, layer 0) and id 343 = cell (col 6, row 6, layer 6).
     stations: List[Station] = []
     station_id = 1
-    for ciy in range(cad_layout.WHITE_SQUARE_ROWS):
-        for cix in range(cad_layout.WHITE_SQUARE_COLS):
-            node_id = _center_node_id(cix, ciy)
-            stations.append(
-                Station(
-                    station_id=station_id,
-                    name=str(station_id),
-                    side="square",
-                    node_id=node_id,
-                    coord=coords[node_id],
+    for ciz in range(cad_layout.WHITE_SQUARE_LAYERS):
+        for ciy in range(cad_layout.WHITE_SQUARE_ROWS):
+            for cix in range(cad_layout.WHITE_SQUARE_COLS):
+                node_id = _center_node_id(cix, ciy, ciz)
+                stations.append(
+                    Station(
+                        station_id=station_id,
+                        name=str(station_id),
+                        side="cube",
+                        node_id=node_id,
+                        coord=coords[node_id],
+                    )
                 )
-            )
-            station_id += 1
+                station_id += 1
 
-    # Depot abstract node sits coincident with the NE grid corner. Outgoing
-    # vehicles transition depot → i_7_7 with zero travel cost; inbound
-    # vehicles do the reverse. The depot's physical L-shape (9 extra dots)
-    # is handled outside the routing graph by the render-layer corridor
-    # logic, similar to how the prior 3×3 depot was handled.
+    # Depot abstract node sits coincident with the top-layer NE grid corner.
+    # Outgoing vehicles transition depot → i_7_7_7 with zero travel cost;
+    # inbound vehicles do the reverse, then descend into the cube. The
+    # depot's physical L-shape is handled outside the routing graph by the
+    # render-layer corridor logic.
     depot_node = "depot"
-    grid_ne_corner = _grid_node_id(len(road_xs) - 1, len(road_ys) - 1)
+    grid_ne_corner = _grid_node_id(
+        len(road_xs) - 1, len(road_ys) - 1, len(road_zs) - 1
+    )
     coords[depot_node] = coords[grid_ne_corner]
     _add_edge(edges, depot_node, grid_ne_corner, 0.0)
 
@@ -161,6 +188,7 @@ def build_world() -> Tuple[WorldGraph, List[Station]]:
         shortest_paths=shortest_paths,
         road_xs=road_xs,
         road_ys=road_ys,
+        road_zs=road_zs,
         depot_anchor=config.DEPOT_ANCHOR_IN,
         depot_slots=depot_slots,
         depot_entries=depot_entries,
@@ -261,18 +289,18 @@ def select_active_job_ids(stations: Iterable[Station], count: int) -> List[int]:
     return selected
 
 
-def _grid_node_id(ix: int, iy: int) -> str:
-    return f"i_{ix}_{iy}"
+def _grid_node_id(ix: int, iy: int, iz: int) -> str:
+    return f"i_{ix}_{iy}_{iz}"
 
 
-def _center_node_id(cix: int, ciy: int) -> str:
-    """Service node at the center of white square (cix, ciy)."""
-    return f"c_{cix}_{ciy}"
+def _center_node_id(cix: int, ciy: int, ciz: int) -> str:
+    """Service node at the center of cube cell (cix, ciy, ciz)."""
+    return f"c_{cix}_{ciy}_{ciz}"
 
 
-def _entry_node_id(cix: int, ciy: int) -> str:
-    """North-edge entry node for white square (cix, ciy)."""
-    return f"n_{cix}_{ciy}"
+def _entry_node_id(cix: int, ciy: int, ciz: int) -> str:
+    """North-edge entry node for cube cell (cix, ciy, ciz)."""
+    return f"n_{cix}_{ciy}_{ciz}"
 
 
 def _add_edge(
@@ -339,4 +367,4 @@ def _reconstruct_path(
 
 
 def euclidean(a: Coord, b: Coord) -> float:
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+    return math.dist(a, b)

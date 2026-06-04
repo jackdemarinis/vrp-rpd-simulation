@@ -13,7 +13,7 @@ from . import cad_layout, config
 from .mapf import MapfInfeasible, plan_space_time, validate as validate_schedule
 from .model import Instance, NodeVisit, Operation, ScheduledSolution
 from .solution_cache import solve_with_solution_cache
-from .solver import SolverRunResult, VRPRPDSolver, orthogonalize_points
+from .solver import SolverRunResult, VRPRPDSolver
 from .world import build_instance
 
 
@@ -33,6 +33,14 @@ PALETTE = [
 ]
 
 BG = (244, 241, 234)
+# Underwater background gradient (top = near surface, deep = sea floor) and
+# the color distant Z-planes fade toward, so the cube recedes into the water.
+WATER_TOP = (46, 124, 176)
+WATER_DEEP = (5, 28, 62)
+WATER_FADE = (16, 58, 104)
+# Per-plane translucency so you can see through the stacked "glass" layers.
+LAYER_BOARD_ALPHA = 92
+LAYER_CELL_ALPHA = 52
 HUD_BG = (35, 42, 52)
 ROAD_STRIP = (92, 95, 99)
 ROAD_GAP = (225, 216, 197)
@@ -187,6 +195,23 @@ class SimulationApp:
         self.paused = False
         self.status_message = ""
         self.dragging_speed_slider = False
+
+        # Isometric 3D view state. `iso_yaw` rotates the cube around its
+        # vertical axis and `iso_pitch` tilts it (drag to orbit); `iso_zoom`
+        # scales (mouse wheel); `active_layer` (None = show all) isolates one
+        # Z-plane. Geometry filled in by _compute_iso_params.
+        self.iso_yaw = 0.6
+        self.iso_pitch = 0.5
+        self.iso_zoom = 1.0
+        self.active_layer: int | None = None
+        self.iso_scale = 1.0
+        self.iso_cx = 0.0
+        self.iso_cy = 0.0
+        # Drag-to-rotate + cached render surfaces (built in _recompute_layout).
+        self.dragging_rotate = False
+        self.last_drag_pos: Tuple[int, int] | None = None
+        self._water_bg: "pygame.Surface | None" = None
+        self._layer_overlay: "pygame.Surface | None" = None
         self.speed_slider_rect = pygame.Rect(0, 0, 0, 0)
         self.speed_knob_rect = pygame.Rect(0, 0, 0, 0)
         self.debug_depot = debug_depot
@@ -278,8 +303,15 @@ class SimulationApp:
                     self._handle_mouse_down(event.pos)
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     self.dragging_speed_slider = False
-                elif event.type == pygame.MOUSEMOTION and self.dragging_speed_slider:
-                    self._update_speed_from_mouse(event.pos)
+                    self.dragging_rotate = False
+                    self.last_drag_pos = None
+                elif event.type == pygame.MOUSEMOTION:
+                    if self.dragging_speed_slider:
+                        self._update_speed_from_mouse(event.pos)
+                    elif self.dragging_rotate:
+                        self._rotate_from_drag(event.pos)
+                elif event.type == pygame.MOUSEWHEEL:
+                    self._zoom_view(event.y)
 
             if not self.paused:
                 sim_accumulator = min(
@@ -356,11 +388,55 @@ class SimulationApp:
         if event.key == pygame.K_PERIOD:
             self.processing_scale = min(12.0, self.processing_scale + 0.25)
             self._refresh_solution("Increased processing time scale")
+            return
+        # --- Isometric 3D view controls ---
+        if event.key == pygame.K_LEFTBRACKET:
+            self.iso_yaw -= math.radians(15)
+            self._compute_iso_params()
+            return
+        if event.key == pygame.K_RIGHTBRACKET:
+            self.iso_yaw += math.radians(15)
+            self._compute_iso_params()
+            return
+        if event.key == pygame.K_UP:
+            base = -1 if self.active_layer is None else self.active_layer
+            self.active_layer = min(config.GRID_LAYERS - 1, base + 1)
+            self.status_message = f"Showing Z-layer {self.active_layer}"
+            return
+        if event.key == pygame.K_DOWN:
+            base = config.GRID_LAYERS if self.active_layer is None else self.active_layer
+            self.active_layer = max(0, base - 1)
+            self.status_message = f"Showing Z-layer {self.active_layer}"
+            return
+        if event.key == pygame.K_a:
+            self.active_layer = None
+            self.status_message = "Showing all Z-layers"
+            return
 
     def _handle_mouse_down(self, pos: Tuple[int, int]) -> None:
         if self.speed_slider_rect.collidepoint(pos) or self.speed_knob_rect.collidepoint(pos):
             self.dragging_speed_slider = True
             self._update_speed_from_mouse(pos)
+            return
+        # Click anywhere in the world (left of the HUD) to grab and orbit the cube.
+        if pos[0] < self.hud_left_px:
+            self.dragging_rotate = True
+            self.last_drag_pos = pos
+
+    def _rotate_from_drag(self, pos: Tuple[int, int]) -> None:
+        if self.last_drag_pos is None:
+            self.last_drag_pos = pos
+            return
+        dx = pos[0] - self.last_drag_pos[0]
+        dy = pos[1] - self.last_drag_pos[1]
+        self.last_drag_pos = pos
+        # Horizontal drag spins around the vertical axis; vertical drag tilts.
+        self.iso_yaw += dx * 0.01
+        self.iso_pitch = max(0.08, min(1.3, self.iso_pitch - dy * 0.004))
+        self._compute_iso_params()
+
+    def _zoom_view(self, wheel_y: float) -> None:
+        self.iso_zoom = max(0.25, min(6.0, self.iso_zoom * (1.12 ** wheel_y)))
 
     def _update_speed_from_mouse(self, pos: Tuple[int, int]) -> None:
         if self.speed_slider_rect.width <= 0:
@@ -463,6 +539,22 @@ class SimulationApp:
         self.hud_top_px = padding
         self.hud_width_px = screen_w - self.hud_left_px - padding
         self.hud_height_px = screen_h - (2 * padding)
+        self._compute_iso_params()
+        self._water_bg = self._build_water_background(screen_w, screen_h)
+        self._layer_overlay = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+
+    def _build_water_background(self, width: int, height: int) -> "pygame.Surface":
+        """Vertical gradient from WATER_TOP (surface) to WATER_DEEP (sea floor)."""
+        surface = pygame.Surface((width, height))
+        height = max(1, height)
+        for y in range(height):
+            t = y / (height - 1) if height > 1 else 0.0
+            color = tuple(
+                int(top + (deep - top) * t)
+                for top, deep in zip(WATER_TOP, WATER_DEEP)
+            )
+            pygame.draw.line(surface, color, (0, y), (width, y))
+        return surface
 
     def _build_station_progress(self) -> Dict[int, Dict[str, float | None]]:
         return {
@@ -873,6 +965,7 @@ class SimulationApp:
             vehicle.route_index,
             round(vehicle.position[0], 3),
             round(vehicle.position[1], 3),
+            round(vehicle.position[2], 3),
             path_distance,
             vehicle.waiting_customer_id,
             vehicle.target_node,
@@ -1136,9 +1229,9 @@ class SimulationApp:
         active = [v for v in self.vehicles if not v.completed]
         for i, va in enumerate(active):
             for vb in active[i + 1:]:
-                dx = va.position[0] - vb.position[0]
-                dy = va.position[1] - vb.position[1]
-                dist = (dx * dx + dy * dy) ** 0.5
+                # Full 3D separation — two Alviks stacked at the same (x, y)
+                # but on different Z-planes are not in contact.
+                dist = euclidean(va.position, vb.position)
                 if dist + 1e-6 < min_sep:
                     raise RuntimeError(
                         f"COLLISION at sim_time={self.sim_time:.3f}s: "
@@ -2322,7 +2415,9 @@ class SimulationApp:
             points = points[:-1]
         if not points or euclidean(points[-1], depot_entry) > 1e-6:
             points.append(depot_entry)
-        return orthogonalize_points(dedupe_points(points))
+        # path_coords already returns a clean axis-aligned 3D polyline, so
+        # the old 2D orthogonalization step is unnecessary here.
+        return dedupe_points(points)
 
     def _depot_entry_to_slot(
         self,
@@ -2352,7 +2447,8 @@ class SimulationApp:
 
         start_on_arm = on_horizontal_arm(start)
         end_on_arm = on_horizontal_arm(end)
-        corner = (entry[0], arm_y)
+        # Depot is planar on the top Z-plane; the corner shares the entry's Z.
+        corner = (entry[0], arm_y, entry[2])
 
         points: List[Coord] = []
         if start_on_arm and end_on_arm:
@@ -2372,88 +2468,116 @@ class SimulationApp:
         return points
 
     def _draw(self) -> None:
-        self.screen.fill(BG)
+        if self._water_bg is not None:
+            self.screen.blit(self._water_bg, (0, 0))
+        else:
+            self.screen.fill(WATER_DEEP)
         self._draw_world()
         self._draw_hud()
         pygame.display.flip()
 
     def _draw_world(self) -> None:
-        world_rect = pygame.Rect(
-            self.world_left_px,
-            self.world_top_px,
-            self.world_width_px,
-            self.world_height_px,
-        )
-        pygame.draw.rect(self.screen, CELL_FILL, world_rect)
-
-        self._draw_grid_cells()
+        # Isometric cube: draw Z-planes back (lowest) to front (highest) so
+        # nearer planes overlap farther ones, then the depot (top plane),
+        # the cube's vertical struts, and finally the vehicles on top.
+        self._draw_vertical_struts()
+        for layer_idx in range(config.GRID_LAYERS):
+            self._draw_layer_board(layer_idx)
+            self._draw_layer_stations(layer_idx)
         self._draw_depot_dock()
-        self._draw_stations()
         self._draw_depot_slots()
         self._draw_vehicles()
 
-    def _draw_depot_dock(self) -> None:
-        """Gray rounded dock backing the L-shaped depot corridor.
+    def _draw_layer_board(self, layer_idx: int) -> None:
+        """Draw one Z-plane as a translucent 'glass' sheet: a tinted corridor
+        board with cream work cells, painted onto an alpha overlay and blended
+        over the water so you can see through the stacked layers. Only the
+        lower WHITE_SQUARE_LAYERS planes carry cells; the top is the depot."""
+        overlay = self._layer_overlay
+        if overlay is None:
+            return
+        z = cad_layout.GRID_ZS[layer_idx]
+        road_xs = self.instance.world.road_xs
+        road_ys = self.instance.world.road_ys
+        half = config.ROAD_WIDTH_IN / 2.0
 
-        Drawn as two overlapping rounded rects (a vertical arm rising from
-        the grid board's NE corner and a horizontal arm) so the parked
-        Alviks read as docked to the grid instead of floating in empty
-        space. The arms are wide enough to seat an Alvik tile with a margin.
-        """
+        overlay.fill((0, 0, 0, 0))
+        board = self._iso_quad(
+            road_xs[0] - half, road_ys[0] - half,
+            road_xs[-1] + half, road_ys[-1] + half, z,
+        )
+        pygame.draw.polygon(
+            overlay, self._layer_tint(ROAD_STRIP, layer_idx) + (LAYER_BOARD_ALPHA,), board
+        )
+        if layer_idx < cad_layout.WHITE_SQUARE_LAYERS:
+            cell_rgba = self._layer_tint(CELL_FILL, layer_idx) + (LAYER_CELL_ALPHA,)
+            for ciy in range(cad_layout.WHITE_SQUARE_ROWS):
+                for cix in range(cad_layout.WHITE_SQUARE_COLS):
+                    cell = self._iso_quad(
+                        road_xs[cix] + half, road_ys[ciy] + half,
+                        road_xs[cix + 1] - half, road_ys[ciy + 1] - half, z,
+                    )
+                    pygame.draw.polygon(overlay, cell_rgba, cell)
+        self.screen.blit(overlay, (0, 0))
+        # Crisp opaque outline so the plane edges stay legible through the glass.
+        pygame.draw.polygon(self.screen, self._layer_tint(ROAD_EDGE, layer_idx), board, width=1)
+
+    def _draw_layer_stations(self, layer_idx: int) -> None:
+        z = cad_layout.GRID_ZS[layer_idx]
+        radius = max(2, int(round(config.ALVIK_SIZE_IN * self._marker_scale() * 0.28)))
+        active_ids = set(self.instance.active_job_ids)
+        edge = self._layer_tint(ROAD_EDGE, layer_idx)
+        for station in self.instance.stations:
+            if abs(station.coord[2] - z) > 1e-6:
+                continue
+            _, color = self._station_state(station.station_id)
+            if station.station_id not in active_ids:
+                color = STATION_INACTIVE
+            color = self._layer_tint(color, layer_idx)
+            sx, sy = self._iso(station.coord)
+            pygame.draw.circle(self.screen, color, (int(sx), int(sy)), radius)
+            pygame.draw.circle(self.screen, edge, (int(sx), int(sy)), radius, width=1)
+
+    def _draw_vertical_struts(self) -> None:
+        """Four vertical edges of the lattice box, conveying the cube's depth."""
+        gx = self.instance.world.road_xs[-1]
+        gy = self.instance.world.road_ys[-1]
+        z_lo = cad_layout.GRID_ZS[0]
+        z_hi = cad_layout.GRID_ZS[-1]
+        strut_color = (150, 196, 224)
+        for x, y in ((0.0, 0.0), (gx, 0.0), (0.0, gy), (gx, gy)):
+            a = self._iso((x, y, z_lo))
+            b = self._iso((x, y, z_hi))
+            pygame.draw.line(
+                self.screen, strut_color,
+                (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), 1,
+            )
+
+    def _draw_depot_dock(self) -> None:
+        """The L-shaped depot dock, drawn as two iso quads on the top Z-plane."""
+        z = cad_layout.DEPOT_Z_IN
+        layer_idx = config.GRID_LAYERS - 1
         hw = config.ALVIK_SIZE_IN * 0.5 + 1.5
-        radius = max(3, int(round(2.0 * self.world_scale)))
         grid_corner_y = self.instance.world.road_ys[-1]
         arm_y = cad_layout.DEPOT_ARM_Y_IN
         vert_x = cad_layout.DEPOT_VERTICAL_X_IN
         arm_west = cad_layout.DEPOT_ARM_XS[0]
         arm_east = cad_layout.DEPOT_ARM_XS[-1]
+        color = self._layer_tint(ROAD_STRIP, layer_idx)
 
-        vertical_arm = self._world_rect_to_screen(
-            vert_x - hw, grid_corner_y - hw, vert_x + hw, arm_y + hw
+        pygame.draw.polygon(
+            self.screen, color,
+            self._iso_quad(vert_x - hw, grid_corner_y - hw, vert_x + hw, arm_y + hw, z),
         )
-        pygame.draw.rect(self.screen, ROAD_STRIP, vertical_arm, border_radius=radius)
-
-        horizontal_arm = self._world_rect_to_screen(
-            arm_west - hw, arm_y - hw, arm_east + hw, arm_y + hw
+        pygame.draw.polygon(
+            self.screen, color,
+            self._iso_quad(arm_west - hw, arm_y - hw, arm_east + hw, arm_y + hw, z),
         )
-        pygame.draw.rect(self.screen, ROAD_STRIP, horizontal_arm, border_radius=radius)
-
-    def _draw_grid_cells(self) -> None:
-        """Draw the corridor grid as a single gray board with rounded outer
-        corners, then punch the 49 white squares out of it as rounded cream
-        cells. This replaces the old thick-line road strips: drawing the
-        board as one rounded rect removes the square notches that those
-        strips left at the four outer corners, and the cells get rounded
-        corners instead of sharp ones. The gray left between cells is exactly
-        ROAD_WIDTH_IN wide, so the corridors look unchanged."""
-        road_xs = self.instance.world.road_xs
-        road_ys = self.instance.world.road_ys
-        half = config.ROAD_WIDTH_IN / 2.0
-
-        board = self._world_rect_to_screen(
-            road_xs[0] - half,
-            road_ys[0] - half,
-            road_xs[-1] + half,
-            road_ys[-1] + half,
-        )
-        board_radius = max(4, int(round(2.5 * self.world_scale)))
-        pygame.draw.rect(self.screen, ROAD_STRIP, board, border_radius=board_radius)
-
-        cell_radius = max(2, int(round(1.4 * self.world_scale)))
-        for ciy in range(cad_layout.WHITE_SQUARE_ROWS):
-            for cix in range(cad_layout.WHITE_SQUARE_COLS):
-                cell = self._world_rect_to_screen(
-                    road_xs[cix] + half,
-                    road_ys[ciy] + half,
-                    road_xs[cix + 1] - half,
-                    road_ys[ciy + 1] - half,
-                )
-                pygame.draw.rect(self.screen, CELL_FILL, cell, border_radius=cell_radius)
 
     def _draw_depot_slots(self) -> None:
-        radius = max(3, int(round(config.ALVIK_SIZE_IN * self.world_scale * 0.35)))
+        radius = max(2, int(round(config.ALVIK_SIZE_IN * self._marker_scale() * 0.35)))
         for slot in self.instance.world.depot_slots:
-            x_px, y_px = self._to_screen(slot)
+            x_px, y_px = self._iso(slot)
             pygame.draw.circle(self.screen, DEPOT_BG, (int(x_px), int(y_px)), radius)
             pygame.draw.circle(self.screen, DEPOT_EDGE, (int(x_px), int(y_px)), radius, width=1)
 
@@ -2498,35 +2622,24 @@ class SimulationApp:
             )
             progress += cycle_len
 
-    def _draw_stations(self) -> None:
-        # Stations sit at the centers of the 49 white squares. Drawn as small
-        # filled dots in the cream cells, off the corridors the robots travel.
-        radius = max(3, int(round(config.ALVIK_SIZE_IN * self.world_scale * 0.28)))
-        active_ids = set(self.instance.active_job_ids)
-        for station in self.instance.stations:
-            state, color = self._station_state(station.station_id)
-            if station.station_id not in active_ids:
-                color = STATION_INACTIVE
-            x_px, y_px = self._to_screen(station.coord)
-            pygame.draw.circle(self.screen, color, (int(x_px), int(y_px)), radius)
-            pygame.draw.circle(self.screen, ROAD_EDGE, (int(x_px), int(y_px)), radius, width=1)
-
     def _draw_vehicles(self) -> None:
-        alvik_px = config.ALVIK_SIZE_IN * self.world_scale
+        alvik_px = max(4, int(round(config.ALVIK_SIZE_IN * self._marker_scale())))
         shadow_offset = 3
-        for vehicle in self.vehicles:
-            x_px, y_px = self._to_screen(vehicle.position)
+        # Back-to-front so nearer Alviks overlap farther ones.
+        ordered = sorted(self.vehicles, key=lambda v: self._iso_depth(v.position))
+        for vehicle in ordered:
+            x_px, y_px = self._iso(vehicle.position)
             rect = pygame.Rect(0, 0, alvik_px, alvik_px)
-            rect.center = (x_px, y_px)
+            rect.center = (int(x_px), int(y_px))
 
             pygame.draw.rect(
                 self.screen,
                 (120, 126, 132),
                 rect.move(shadow_offset, shadow_offset),
-                border_radius=8,
+                border_radius=6,
             )
-            pygame.draw.rect(self.screen, vehicle.color, rect, border_radius=8)
-            pygame.draw.rect(self.screen, ROAD_EDGE, rect, width=2, border_radius=8)
+            pygame.draw.rect(self.screen, vehicle.color, rect, border_radius=6)
+            pygame.draw.rect(self.screen, ROAD_EDGE, rect, width=2, border_radius=6)
 
             marker_color = STATION_READY if vehicle.load_marker() > 0 else TEXT_LIGHT
             marker_radius = max(4, int(alvik_px * 0.12))
@@ -2564,12 +2677,20 @@ class SimulationApp:
             (f"Planned makespan: {self.solution.makespan:6.1f}s", self.font),
             (f"Sim completion: {self._sim_completion_text()}", self.font),
             (f"Cross-agent jobs: {self._cross_agent_jobs()}", self.font),
+            (
+                "Z-layer: "
+                + ("all" if self.active_layer is None else str(self.active_layer)),
+                self.font,
+            ),
             ("", self.font),
             ("Controls", self.font),
             ("Drag slider for speed", self.font_small),
             ("Space pause, R reset", self.font_small),
             ("- = jobs down/up", self.font_small),
             (", . process time down/up", self.font_small),
+            ("Drag mouse to rotate cube", self.font_small),
+            ("Scroll wheel to zoom", self.font_small),
+            ("[ ] rotate, Up/Down layer, A all", self.font_small),
             ("F or F11 fullscreen", self.font_small),
         ]
         for text, font in lines:
@@ -2661,25 +2782,90 @@ class SimulationApp:
             return f"{completion:6.1f}s"
         return "running"
 
-    def _to_screen(self, coord: Coord) -> Tuple[float, float]:
-        x_px = self.world_left_px + (coord[0] * self.world_scale)
-        y_px = self.world_top_px + ((config.WORLD_HEIGHT_IN - coord[1]) * self.world_scale)
-        return x_px, y_px
+    def _iso_raw(self, coord: Coord) -> Tuple[float, float]:
+        """Project world (x, y, z) inches to unscaled isometric plane coords.
 
-    def _world_rect_to_screen(
-        self, x0: float, y0: float, x1: float, y1: float
-    ) -> pygame.Rect:
-        """Screen-space pygame.Rect for the world box [x0, x1] x [y0, y1].
-        Screen Y is flipped, so the NW world corner (x0, y1) is the rect's
-        top-left."""
-        left, top = self._to_screen((x0, y1))
-        right, bottom = self._to_screen((x1, y0))
-        return pygame.Rect(
-            int(round(left)),
-            int(round(top)),
-            int(round(right - left)),
-            int(round(bottom - top)),
+        The X/Y plane is rotated by `iso_yaw` about the vertical axis and
+        tilted into a 2:1 diamond; +Z (depth/height) lifts the point up the
+        screen. Scaling/centering is applied by `_iso`.
+        """
+        c = math.cos(self.iso_yaw)
+        s = math.sin(self.iso_yaw)
+        xr = coord[0] * c - coord[1] * s
+        yr = coord[0] * s + coord[1] * c
+        return (xr - yr, (xr + yr) * self.iso_pitch - coord[2])
+
+    def _iso(self, coord: Coord) -> Tuple[float, float]:
+        px, py = self._iso_raw(coord)
+        s = self.iso_scale * self.iso_zoom
+        return (self.iso_cx + px * s, self.iso_cy + py * s)
+
+    def _marker_scale(self) -> float:
+        """Pixels-per-inch for sizing dots/tiles, so they grow when zooming."""
+        return self.iso_scale * self.iso_zoom
+
+    # Back-compat alias: any remaining caller gets the isometric projection.
+    def _to_screen(self, coord: Coord) -> Tuple[float, float]:
+        return self._iso(coord)
+
+    def _iso_depth(self, coord: Coord) -> float:
+        """Painter's-algorithm key: larger = nearer the viewer (draw later)."""
+        c = math.cos(self.iso_yaw)
+        s = math.sin(self.iso_yaw)
+        xr = coord[0] * c - coord[1] * s
+        yr = coord[0] * s + coord[1] * c
+        return (xr + yr) + coord[2] * 1e-3
+
+    def _iso_quad(
+        self, x0: float, y0: float, x1: float, y1: float, z: float
+    ) -> List[Tuple[float, float]]:
+        """Four screen-space corners of the planar world rect [x0,x1]x[y0,y1]
+        at height z — a parallelogram under the isometric projection."""
+        return [
+            self._iso((x0, y0, z)),
+            self._iso((x1, y0, z)),
+            self._iso((x1, y1, z)),
+            self._iso((x0, y1, z)),
+        ]
+
+    def _layer_tint(
+        self, color: Tuple[int, int, int], layer_idx: int
+    ) -> Tuple[int, int, int]:
+        """Fade `color` toward the background by depth/active-layer state.
+
+        With no active layer, lower planes (farther back) read dimmer. When a
+        layer is isolated, only it shows at full strength.
+        """
+        n = max(1, config.GRID_LAYERS - 1)
+        if self.active_layer is not None:
+            f = 1.0 if layer_idx == self.active_layer else 0.16
+        else:
+            f = 0.45 + 0.55 * (layer_idx / n)
+        # Deeper planes fade toward the dark water so the cube recedes.
+        return tuple(int(b + (c - b) * f) for c, b in zip(color, WATER_FADE))
+
+    def _compute_iso_params(self) -> None:
+        """Fit the projected world cube into the world drawing rectangle."""
+        if not hasattr(self, "world_width_px"):
+            return
+        corners = [
+            (x, y, z)
+            for x in (0.0, config.WORLD_WIDTH_IN)
+            for y in (0.0, config.WORLD_HEIGHT_IN)
+            for z in (0.0, config.WORLD_DEPTH_IN)
+        ]
+        projected = [self._iso_raw(pt) for pt in corners]
+        xs = [p[0] for p in projected]
+        ys = [p[1] for p in projected]
+        span_x = (max(xs) - min(xs)) or 1.0
+        span_y = (max(ys) - min(ys)) or 1.0
+        self.iso_scale = 0.92 * min(
+            self.world_width_px / span_x, self.world_height_px / span_y
         )
+        mid_x = (min(xs) + max(xs)) / 2.0
+        mid_y = (min(ys) + max(ys)) / 2.0
+        self.iso_cx = self.world_left_px + self.world_width_px / 2.0 - self.iso_scale * mid_x
+        self.iso_cy = self.world_top_px + self.world_height_px / 2.0 - self.iso_scale * mid_y
 
     def _fit_font(self, text: str, max_width: int, max_height: int) -> pygame.font.Font:
         size = min(self.font_small.get_height(), max_height)
@@ -2704,7 +2890,7 @@ def build_path_state(points: List[Coord]) -> PathState | None:
 
 def interpolate_polyline(points: List[Coord], fraction: float) -> Coord:
     if not points:
-        return (0.0, 0.0)
+        return (0.0, 0.0, 0.0)
     if len(points) == 1:
         return points[0]
     fraction = max(0.0, min(1.0, fraction))
@@ -2717,9 +2903,9 @@ def interpolate_polyline(points: List[Coord], fraction: float) -> Coord:
     for index, seg_len in enumerate(lengths):
         if traversed + seg_len >= target:
             local = 0.0 if seg_len == 0 else (target - traversed) / seg_len
-            ax, ay = points[index]
-            bx, by = points[index + 1]
-            return (ax + ((bx - ax) * local), ay + ((by - ay) * local))
+            a = points[index]
+            b = points[index + 1]
+            return tuple(ac + ((bc - ac) * local) for ac, bc in zip(a, b))
         traversed += seg_len
     return points[-1]
 
@@ -2737,7 +2923,8 @@ def dedupe_points(points: List[Coord]) -> List[Coord]:
     deduped: List[Coord] = []
     for point in points:
         if not deduped or not (
-            math.isclose(point[0], deduped[-1][0]) and math.isclose(point[1], deduped[-1][1])
+            len(point) == len(deduped[-1])
+            and all(math.isclose(a, b) for a, b in zip(point, deduped[-1]))
         ):
             deduped.append(point)
     return deduped
@@ -2761,7 +2948,7 @@ def subtract_span_list(
 
 
 def euclidean(a: Coord, b: Coord) -> float:
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+    return math.dist(a, b)
 
 
 def moving_points_min_distance(

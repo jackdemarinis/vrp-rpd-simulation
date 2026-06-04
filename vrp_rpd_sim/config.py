@@ -17,8 +17,12 @@ from . import cad_layout
 
 WORLD_WIDTH_IN = cad_layout.WORLD_WIDTH_IN
 WORLD_HEIGHT_IN = cad_layout.WORLD_HEIGHT_IN
+WORLD_DEPTH_IN = cad_layout.WORLD_DEPTH_IN
 WORLD_MIN = cad_layout.WORLD_MIN
 WORLD_MAX = cad_layout.WORLD_MAX
+
+# Number of Z (depth) layers in the cube lattice.
+GRID_LAYERS = cad_layout.GRID_LAYERS
 
 # Road visual width — single lane, two-way. Wide enough for one Alvik plus
 # a little visual padding so traffic reads as on-road.
@@ -52,14 +56,16 @@ VEHICLE_CAPACITY = 4
 # point for the atan2 polar sort. We pick the centroid of the 10 parking
 # slots so the angular ordering wraps the whole queue.
 DEPOT_ANCHOR_IN = (
-    sum(x for x, _ in cad_layout.ALL_DEPOT_SLOTS) / len(cad_layout.ALL_DEPOT_SLOTS),
-    sum(y for _, y in cad_layout.ALL_DEPOT_SLOTS) / len(cad_layout.ALL_DEPOT_SLOTS),
+    sum(slot[0] for slot in cad_layout.ALL_DEPOT_SLOTS) / len(cad_layout.ALL_DEPOT_SLOTS),
+    sum(slot[1] for slot in cad_layout.ALL_DEPOT_SLOTS) / len(cad_layout.ALL_DEPOT_SLOTS),
+    sum(slot[2] for slot in cad_layout.ALL_DEPOT_SLOTS) / len(cad_layout.ALL_DEPOT_SLOTS),
 )
 
 # Stations and processing ----------------------------------------------------
 
-# The 49 white squares (7x7 cells between the corridors) are the stations now
-# (vs. one-per-intersection, which had no physical work cell to pull into).
+# The cube has 7x7x7 = 343 cells (the gaps between corridors on every Z-layer),
+# each a station. ACTIVE_JOB_COUNT selects a spread-out subset to actually
+# service; keep it modest for fast iteration (must be <= 343).
 ACTIVE_JOB_COUNT = 49
 PROCESSING_TIME_VARIANT = "base"  # "base", "2x", "5x", "1R10", "1R20"
 PROCESSING_TIME_SEED = 7
@@ -128,8 +134,8 @@ BRKGA_INFEASIBILITY_PENALTY = 10**6
 
 DEFAULT_RUNTIME_CONFIG_PATH = Path("simulation_config.json")
 DEFAULT_SOLUTION_CACHE_DIR = ".solution_cache"
-SOLUTION_CACHE_SCHEMA_VERSION = 2
-SOLUTION_CACHE_ALGORITHM_VERSION = "2026-06-03-squares"
+SOLUTION_CACHE_SCHEMA_VERSION = 3
+SOLUTION_CACHE_ALGORITHM_VERSION = "2026-06-03-cube"
 
 
 @dataclass(frozen=True)
