@@ -65,8 +65,9 @@ DEPOT_ANCHOR_IN = (
 
 # The cube has 7x7x7 = 343 cells (the gaps between corridors on every Z-layer),
 # each a station. ACTIVE_JOB_COUNT selects a spread-out subset to actually
-# service; keep it modest for fast iteration (must be <= 343).
-ACTIVE_JOB_COUNT = 49
+# service (must be <= 343). Solve time grows steeply with job count
+# (~3 min at 49, ~27 min at 98), so this is a balance, not a hard cap.
+ACTIVE_JOB_COUNT = 72
 PROCESSING_TIME_VARIANT = "base"  # "base", "2x", "5x", "1R10", "1R20"
 PROCESSING_TIME_SEED = 7
 PROCESSING_TIME_SCALE = 1.0

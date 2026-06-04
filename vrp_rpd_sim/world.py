@@ -263,6 +263,12 @@ def build_processing_times(
     return processing_times
 
 
+# Fixed base seed for active-job selection. Keeps the chosen subset
+# deterministic (stable solution cache + playback) while distributing jobs
+# across the whole cube.
+_ACTIVE_JOB_SELECTION_SEED = 1987
+
+
 def select_active_job_ids(stations: Iterable[Station], count: int) -> List[int]:
     station_list = list(stations)
     if count < 1:
@@ -274,18 +280,12 @@ def select_active_job_ids(stations: Iterable[Station], count: int) -> List[int]:
     if count == len(ordered_ids):
         return ordered_ids
 
-    selected: List[int] = []
-    used_indexes = set()
-    total = len(ordered_ids)
-    for pick in range(count):
-        index = min(total - 1, math.floor(((pick + 0.5) * total) / count))
-        while index in used_indexes and index + 1 < total:
-            index += 1
-        while index in used_indexes and index > 0:
-            index -= 1
-        used_indexes.add(index)
-        selected.append(ordered_ids[index])
-    return selected
+    # Spread the active jobs across all three axes. The previous evenly-spaced
+    # index sampling aliased with the 7-cell column period (343 / 49 == 7), so
+    # every pick landed in the dead-center column. A seeded sample stays
+    # deterministic for a given count but scatters jobs through the volume.
+    rng = random.Random(_ACTIVE_JOB_SELECTION_SEED + count)
+    return sorted(rng.sample(ordered_ids, count))
 
 
 def _grid_node_id(ix: int, iy: int, iz: int) -> str:
